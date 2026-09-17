@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    
+    <springProperty scope="context" name="applicationName" source="spring.application.name"/>
+    <springProperty scope="context" name="environment" source="ENVIRONMENT" defaultValue="dev"/>
+    
+    <!-- Console appender with JSON formatting -->
+    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- Include MDC fields -->
+            <includeMdcKeyName>correlation_id</includeMdcKeyName>
+            <includeMdcKeyName>workflow_id</includeMdcKeyName>
+            <includeMdcKeyName>execution_id</includeMdcKeyName>
+            <includeMdcKeyName>task_id</includeMdcKeyName>
+            <includeMdcKeyName>user_id</includeMdcKeyName>
+            <includeMdcKeyName>worker_id</includeMdcKeyName>
+            
+            <!-- Custom fields -->
+            <customFields>{"service":"${applicationName}","environment":"${environment}"}</customFields>
+            
+            <!-- Field name mapping -->
+            <fieldNames>
+                <timestamp>timestamp</timestamp>
+                <message>message</message>
+                <logger>logger</logger>
+                <level>level</level>
+                <thread>thread</thread>
+                <stackTrace>stack_trace</stackTrace>
+            </fieldNames>
+            
+            <!-- Include stack traces for errors -->
+            <throwableConverter class="net.logstash.logback.stacktrace.ShortenedThrowableConverter">
+                <maxDepthPerThrowable>30</maxDepthPerThrowable>
+                <maxLength>4096</maxLength>
+                <shortenedClassNameLength>30</shortenedClassNameLength>
+                <exclude>sun\.reflect\..*</exclude>
+                <exclude>net\.sf\.cglib\..*</exclude>
+                <rootCauseFirst>true</rootCauseFirst>
+            </throwableConverter>
+        </encoder>
+    </appender>
+    
+    <!-- Console appender with readable formatting (for development) -->
+    <appender name="CONSOLE_READABLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%X{correlation_id}] [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    
+    <!-- File appender for persistent logs (optional) -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>logs/${applicationName}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>logs/${applicationName}.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <timeBasedFileNamingAndTriggeringPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedFNATP">
+                <maxFileSize>100MB</maxFileSize>
+            </timeBasedFileNamingAndTriggeringPolicy>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>1GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeMdcKeyName>correlation_id</includeMdcKeyName>
+            <includeMdcKeyName>workflow_id</includeMdcKeyName>
+            <includeMdcKeyName>execution_id</includeMdcKeyName>
+            <includeMdcKeyName>task_id</includeMdcKeyName>
+            <includeMdcKeyName>user_id</includeMdcKeyName>
+            <customFields>{"service":"${applicationName}","environment":"${environment}"}</customFields>
+        </encoder>
+    </appender>
+    
+    <!-- Async wrapper for better performance -->
+    <appender name="ASYNC_CONSOLE" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="CONSOLE_JSON"/>
+        <queueSize>512</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <includeCallerData>false</includeCallerData>
+    </appender>
+    
+    <!-- Spring profile-based configuration -->
+    <springProfile name="dev,local">
+        <!-- Use readable format in development -->
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_READABLE"/>
+        </root>
+        <logger name="com.chronos" level="DEBUG"/>
+    </springProfile>
+    
+    <springProfile name="prod,production">
+        <!-- Use JSON format in production -->
+        <root level="INFO">
+            <appender-ref ref="ASYNC_CONSOLE"/>
+        </root>
+        <logger name="com.chronos" level="INFO"/>
+    </springProfile>
+    
+    <!-- Default configuration (JSON) -->
+    <springProfile name="!dev & !local & !prod & !production">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_JSON"/>
+        </root>
+        <logger name="com.chronos" level="DEBUG"/>
+    </springProfile>
+    
+    <!-- Reduce noise from third-party libraries -->
+    <logger name="org.springframework" level="INFO"/>
+    <logger name="org.springframework.data.mongodb" level="INFO"/>
+    <logger name="org.springframework.kafka" level="INFO"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="io.micrometer" level="INFO"/>
+    <logger name="org.mongodb" level="WARN"/>
+</configuration>

@@ -1,0 +1,419 @@
+services:
+  # ============================================================================
+  # Infrastructure Services
+  # ============================================================================
+  
+  # MongoDB - Document database for workflow state
+  mongodb:
+    image: mongo:7.0
+    container_name: chronos-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_ROOT_USERNAME:-chronos}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_ROOT_PASSWORD:-chronos123}
+      MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-chronos}
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./infrastructure/mongodb/init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+      - ./infrastructure/mongodb/mongod.conf:/etc/mongod.conf:ro
+    networks:
+      - chronos-network
+    healthcheck:
+      test: |
+        mongosh --quiet --eval "
+          try {
+            db.adminCommand('ping');
+            print('ok');
+          } catch(e) {
+            print('failed');
+            quit(1);
+          }
+        "
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Zookeeper - Coordination service for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: chronos-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_MAX_CLIENT_CNXNS: 60
+      ZOOKEEPER_AUTOPURGE_SNAP_RETAIN_COUNT: 3
+      ZOOKEEPER_AUTOPURGE_PURGE_INTERVAL: 24
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - chronos-network
+    healthcheck:
+      test: echo ruok | nc localhost 2181 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Kafka - Event streaming platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: chronos-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      
+      # Listeners configuration
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      
+      # Topic configuration
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      
+      # Performance tuning for local development
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      
+      # JVM settings
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - chronos-network
+    healthcheck:
+      test: kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Redis - Distributed coordination and caching
+  redis:
+    image: redis:7.2-alpine
+    container_name: chronos-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --auto-aof-rewrite-percentage 100
+      --auto-aof-rewrite-min-size 64mb
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --dir /data
+      --appendfilename "appendonly.aof"
+      --loglevel notice
+    volumes:
+      - redis_data:/data
+    networks:
+      - chronos-network
+    healthcheck:
+      test: redis-cli ping | grep PONG
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Observability Services
+  # ============================================================================
+  
+  # Prometheus - Metrics collection
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: chronos-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=5GB'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:9090/-/healthy || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Grafana - Metrics visualization
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: chronos-grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      GF_SERVER_ROOT_URL: "http://localhost:3000"
+      GF_LOG_LEVEL: info
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:3000/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Application Services
+  # ============================================================================
+  
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: chronos-api-gateway
+    restart: unless-stopped
+    depends_on:
+      workflow-service:
+        condition: service_healthy
+    ports:
+      - "${API_GATEWAY_PORT:-8080}:8080"
+    environment:
+      WORKFLOW_SERVICE_URL: http://workflow-service:8081
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production-min-256-bits-required}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
+      LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
+      LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Workflow Service
+  workflow-service:
+    build:
+      context: ./services/workflow-service
+      dockerfile: Dockerfile
+    container_name: chronos-workflow-service
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${WORKFLOW_SERVICE_PORT:-8081}:8081"
+    environment:
+      MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-chronos}:${MONGODB_ROOT_PASSWORD:-chronos123}@mongodb:27017/${MONGODB_DATABASE:-chronos}?authSource=admin
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-chronos}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
+      LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:8081/actuator/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Scheduler Service
+  scheduler-service:
+    build:
+      context: ./services/scheduler-service
+      dockerfile: Dockerfile
+    container_name: chronos-scheduler-service
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${SCHEDULER_SERVICE_PORT:-8082}:8082"
+    environment:
+      MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-chronos}:${MONGODB_ROOT_PASSWORD:-chronos123}@mongodb:27017/${MONGODB_DATABASE:-chronos}?authSource=admin
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-chronos}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
+      LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:8082/actuator/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Worker Service (Horizontally Scalable)
+  worker-service:
+    build:
+      context: ./services/worker-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8083-8093:8083"
+    environment:
+      MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-chronos}:${MONGODB_ROOT_PASSWORD:-chronos123}@mongodb:27017/${MONGODB_DATABASE:-chronos}?authSource=admin
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-chronos}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      WORKER_ID: worker-${HOSTNAME:-unknown}
+      LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
+      LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
+    networks:
+      - chronos-network
+    healthcheck:
+      test: wget --quiet --tries=1 --spider http://localhost:8083/actuator/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      replicas: 3
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  chronos-network:
+    driver: bridge
+    name: chronos-network
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  # MongoDB volumes
+  mongodb_data:
+    name: chronos-mongodb-data
+  mongodb_config:
+    name: chronos-mongodb-config
+  
+  # Kafka volumes
+  kafka_data:
+    name: chronos-kafka-data
+  
+  # Zookeeper volumes
+  zookeeper_data:
+    name: chronos-zookeeper-data
+  zookeeper_logs:
+    name: chronos-zookeeper-logs
+  
+  # Redis volume
+  redis_data:
+    name: chronos-redis-data
+  
+  # Observability volumes
+  prometheus_data:
+    name: chronos-prometheus-data
+  grafana_data:
+    name: chronos-grafana-data

@@ -1,0 +1,132 @@
+spring:
+  application:
+    name: worker-service
+  
+  # MongoDB and Redis Configuration
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+  
+  # Kafka Configuration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: worker-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: ${SPRING_SHUTDOWN_TIMEOUT:90s}
+
+# Worker Configuration
+worker:
+  id: ${WORKER_ID:worker-${random.uuid}}
+  supported-task-types:
+    - IMAGE_RESIZE
+    - IMAGE_COMPRESS
+    - DATA_PROCESSING
+    - DATA_VALIDATION
+  heartbeat:
+    interval-seconds: 10
+    ttl-seconds: 30
+  task-lock:
+    ttl-seconds: 300
+
+# Distributed Lock Configuration
+chronos:
+  lock:
+    task-lock-ttl: ${TASK_LOCK_TTL:5m}
+    task-lock-prefix: "chronos:lock:task:"
+  task:
+    # Lease configuration
+    lease-duration: ${TASK_LEASE_DURATION:5m}
+    # Lease renewal configuration (for long-running tasks)
+    lease-renewal-interval: ${TASK_LEASE_RENEWAL_INTERVAL:2m}
+    lease-extension-duration: ${TASK_LEASE_EXTENSION_DURATION:3m}
+  worker:
+    # Graceful shutdown timeout
+    shutdown-timeout: ${WORKER_SHUTDOWN_TIMEOUT:60s}
+  kafka:
+    # Rebalance timeout (wait for in-flight tasks before partition revocation)
+    rebalance-timeout: ${KAFKA_REBALANCE_TIMEOUT:30s}
+
+# Logging
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: INFO
+    org.springframework.data.redis: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# Resilience4j Circuit Breaker Configuration
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 100
+        minimum-number-of-calls: 10
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      mongodb:
+        base-config: default
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+      redis:
+        base-config: default
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 20s
+
+# Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents}
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true

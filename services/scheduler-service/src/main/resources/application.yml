@@ -1,0 +1,155 @@
+spring:
+  application:
+    name: scheduler-service
+  
+  # MongoDB and Redis Configuration
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+  
+  # Kafka Configuration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: scheduler-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+
+server:
+  port: 8082
+
+# Scheduler Configuration
+scheduler:
+  id: ${SCHEDULER_ID:scheduler-${random.uuid}}
+  leader:
+    lock-key: "scheduler:leader:lock"
+    lock-ttl-seconds: 10
+    renewal-interval-seconds: 5
+  worker-health-check:
+    interval-seconds: 15
+    heartbeat-ttl-seconds: 30
+
+# Chronos Scheduler Configuration
+chronos:
+  scheduler:
+    # Leader Election
+    leader-election:
+      ttl: ${SCHEDULER_LEADER_TTL:30s}
+      renewal-interval: ${SCHEDULER_LEADER_RENEWAL:10000}
+      acquisition-retry: ${SCHEDULER_LEADER_RETRY:5s}
+    
+    # Scheduling
+    scheduling:
+      interval: ${SCHEDULER_INTERVAL:5000}  # 5 seconds
+      batch-size: ${SCHEDULER_BATCH_SIZE:100}
+      enabled: ${SCHEDULER_ENABLED:true}
+    
+    # Execution Idempotency
+    execution-idempotency:
+      ttl: ${EXECUTION_IDEMPOTENCY_TTL:1h}
+    
+    # Restart Recovery
+    restart-recovery:
+      enabled: ${RECOVERY_ENABLED:true}
+      task-republish-delay: ${RECOVERY_REPUBLISH_DELAY:1m}
+  
+  # Distributed Lock Configuration
+  lock:
+    task-lock-ttl: ${TASK_LOCK_TTL:5m}
+    task-lock-prefix: "chronos:lock:task:"
+    execution-lock-prefix: "chronos:lock:execution:"
+    cleanup-interval: ${LOCK_CLEANUP_INTERVAL:1m}
+    orphaned-lock-threshold: ${ORPHANED_LOCK_THRESHOLD:10m}
+    max-retry-attempts: ${LOCK_MAX_RETRY_ATTEMPTS:3}
+    retry-delay: ${LOCK_RETRY_DELAY:100ms}
+  
+  # Task Configuration
+  task:
+    # Lease configuration
+    lease-duration: ${TASK_LEASE_DURATION:5m}
+    # Lease renewal configuration (for long-running tasks)
+    lease-renewal-interval: ${TASK_LEASE_RENEWAL_INTERVAL:2m}
+    lease-extension-duration: ${TASK_LEASE_EXTENSION_DURATION:3m}
+  
+  # Transactional Outbox Configuration
+  outbox:
+    poll-interval: ${OUTBOX_POLL_INTERVAL:1000}  # 1 second
+    batch-size: ${OUTBOX_BATCH_SIZE:100}
+    max-attempts: ${OUTBOX_MAX_ATTEMPTS:5}
+    cleanup-after: ${OUTBOX_CLEANUP_AFTER:7d}
+
+# Logging
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: INFO
+    org.springframework.data.redis: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# Resilience4j Circuit Breaker Configuration
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 100
+        minimum-number-of-calls: 10
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      mongodb:
+        base-config: default
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+      redis:
+        base-config: default
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 20s
+
+# Actuator Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents}
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+  health:
+    circuitbreakers:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true

@@ -1,0 +1,52 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'chronos-local'
+    environment: 'development'
+
+scrape_configs:
+  # API Gateway
+  - job_name: 'api-gateway'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['api-gateway:9080']
+        labels:
+          service: 'api-gateway'
+
+  # Workflow Service
+  - job_name: 'workflow-service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['workflow-service:9081']
+        labels:
+          service: 'workflow-service'
+
+  # Scheduler Service
+  - job_name: 'scheduler-service'
+    metrics_path: '/actuator/prometheus'
+    static_configs:
+      - targets: ['scheduler-service:9082']
+        labels:
+          service: 'scheduler-service'
+
+  # Worker Service (supports multiple instances)
+  - job_name: 'worker-service'
+    metrics_path: '/actuator/prometheus'
+    dns_sd_configs:
+      - names:
+          - 'worker-service'
+        type: 'A'
+        port: 9083
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'worker-service'
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'

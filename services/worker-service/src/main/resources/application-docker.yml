@@ -1,0 +1,151 @@
+# ============================================================================
+# Worker Service - Docker Profile Configuration
+# ============================================================================
+# This configuration is activated when SPRING_PROFILES_ACTIVE=docker
+# Optimized for containerized deployment with Docker Compose
+# ============================================================================
+
+spring:
+  application:
+    name: worker-service
+  
+  # MongoDB Configuration (Docker internal networking)
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@mongodb:27017/chronos?authSource=admin}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+    
+    # Redis Configuration (Docker internal networking)
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+        shutdown-timeout: 100ms
+  
+  # Kafka Configuration (Docker internal networking)
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+        compression.type: snappy
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: worker-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      max-poll-records: 10
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+        max.poll.interval.ms: 300000
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8083}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    connection-timeout: 20s
+
+# Worker Configuration
+worker:
+  id: ${WORKER_ID:worker-${HOSTNAME:unknown}}
+  supported-task-types:
+    - IMAGE_RESIZE
+    - IMAGE_COMPRESS
+    - DATA_PROCESSING
+    - DATA_VALIDATION
+    - FILE_CONVERSION
+    - NOTIFICATION
+  heartbeat:
+    interval-seconds: ${WORKER_HEARTBEAT_INTERVAL:10}
+    ttl-seconds: ${WORKER_HEARTBEAT_TTL:30}
+  task-lock:
+    ttl-seconds: ${WORKER_TASK_LOCK_TTL:300}
+  concurrency:
+    max-concurrent-tasks: ${WORKER_MAX_CONCURRENT_TASKS:10}
+
+# Distributed Lock Configuration
+chronos:
+  lock:
+    task-lock-ttl: ${TASK_LOCK_TTL:5m}
+    task-lock-prefix: "chronos:lock:task:"
+    execution-lock-prefix: "chronos:lock:execution:"
+
+# Actuator Configuration
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9083}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,env,loggers
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+    mongo:
+      enabled: true
+    redis:
+      enabled: true
+    kafka:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      worker_id: ${worker.id}
+      service: worker
+      environment: docker
+    distribution:
+      percentiles-histogram:
+        chronos.task.duration: true
+        chronos.task.processing.time: true
+      slo:
+        chronos.task.duration: 100ms,500ms,1s,5s,10s,30s
+
+# Logging Configuration
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: ${LOGGING_LEVEL_MONGODB:INFO}
+    org.springframework.data.redis: ${LOGGING_LEVEL_REDIS:INFO}
+    org.springframework.kafka: ${LOGGING_LEVEL_KAFKA:INFO}
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:%wEx}"
+  file:
+    name: /app/logs/worker-service.log
+    max-size: 100MB
+    max-history: 10
+    total-size-cap: 1GB
+
+# Spring Boot Lifecycle
+spring.lifecycle:
+  timeout-per-shutdown-phase: 30s

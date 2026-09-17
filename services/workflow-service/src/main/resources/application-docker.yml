@@ -1,0 +1,126 @@
+# ============================================================================
+# Workflow Service - Docker Profile Configuration
+# ============================================================================
+# This configuration is activated when SPRING_PROFILES_ACTIVE=docker
+# Optimized for containerized deployment with Docker Compose
+# ============================================================================
+
+spring:
+  application:
+    name: workflow-service
+  
+  # MongoDB Configuration (Docker internal networking)
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@mongodb:27017/chronos?authSource=admin}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+  
+  # Kafka Configuration (Docker internal networking)
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+        compression.type: snappy
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: workflow-service-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8081}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    connection-timeout: 20s
+    max-connections: 10000
+
+# JWT Configuration
+chronos:
+  security:
+    jwt:
+      secret: ${JWT_SECRET:your-secret-key-change-in-production-min-256-bits-required}
+      expiration: ${JWT_EXPIRATION_MS:86400000}
+
+# Actuator Configuration
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9081}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,env,loggers
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+      probes:
+        enabled: true
+    prometheus:
+      enabled: true
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+    mongo:
+      enabled: true
+    kafka:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+        step: 15s
+    tags:
+      application: ${spring.application.name}
+      service: workflow
+      environment: docker
+      instance: ${HOSTNAME:unknown}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        chronos.workflow.duration: true
+        chronos.task.duration: true
+        chronos.task.latency: true
+        chronos.kafka.message.processing.duration: true
+      slo:
+        http.server.requests: 100ms,200ms,500ms,1s,2s,5s
+        chronos.workflow.duration: 1s,5s,10s,30s,60s,300s
+        chronos.task.duration: 100ms,500ms,1s,5s,10s,30s
+
+# Logging Configuration
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: ${LOGGING_LEVEL_MONGODB:INFO}
+    org.springframework.kafka: ${LOGGING_LEVEL_KAFKA:INFO}
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:%wEx}"
+  file:
+    name: /app/logs/workflow-service.log
+    max-size: 100MB
+    max-history: 10
+    total-size-cap: 1GB
+
+# Spring Boot Lifecycle
+spring.lifecycle:
+  timeout-per-shutdown-phase: 30s

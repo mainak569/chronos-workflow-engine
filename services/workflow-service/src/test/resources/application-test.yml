@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: workflow-service-test
+  
+  # MongoDB will be configured by Testcontainers
+  data:
+    mongodb:
+      auto-index-creation: true
+  
+  # Disable Kafka for tests (not needed for workflow CRUD)
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.kafka.KafkaAutoConfiguration
+
+# Logging for tests
+logging:
+  level:
+    root: INFO
+    com.chronos: DEBUG
+    org.springframework.data.mongodb: INFO
+    org.testcontainers: INFO

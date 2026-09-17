@@ -1,0 +1,117 @@
+spring:
+  application:
+    name: workflow-service
+  
+  # MongoDB Configuration
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+  
+  # Kafka Configuration
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: workflow-service-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+
+server:
+  port: 8081
+
+# JWT Configuration
+chronos:
+  security:
+    jwt:
+      # Secret key for JWT signing (MUST be set via environment variable in production)
+      # Minimum 256 bits (32 characters) for HS256
+      secret: ${CHRONOS_JWT_SECRET:changeme-this-is-not-secure-for-production-use-at-least-32-chars}
+      # Token expiration in milliseconds (default: 24 hours)
+      expiration: ${CHRONOS_JWT_EXPIRATION:86400000}
+
+# Logging
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# Resilience4j Circuit Breaker Configuration
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 5
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 100
+        minimum-number-of-calls: 10
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      mongodb:
+        base-config: default
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+
+# Observability - Actuator & Metrics Configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,info,metrics,prometheus,circuitbreakers,circuitbreakerevents}
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      show-components: always
+    prometheus:
+      enabled: true
+  health:
+    circuitbreakers:
+      enabled: true
+    mongo:
+      enabled: true
+    kafka:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+        step: 15s  # Scrape interval
+    tags:
+      application: ${spring.application.name}
+      environment: ${ENVIRONMENT:dev}
+      instance: ${HOSTNAME:unknown}
+    distribution:
+      percentiles-histogram:
+        # Enable histogram for HTTP requests
+        http.server.requests: true
+        # Enable histogram for custom metrics
+        chronos.workflow.duration: true
+        chronos.task.duration: true
+        chronos.task.latency: true
+        chronos.kafka.message.processing.duration: true
+      slo:
+        # Service Level Objectives
+        http.server.requests: 100ms,200ms,500ms,1s,2s,5s
+        chronos.workflow.duration: 1s,5s,10s,30s,60s,300s
+        chronos.task.duration: 100ms,500ms,1s,5s,10s,30s

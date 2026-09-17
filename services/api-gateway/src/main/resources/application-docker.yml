@@ -1,0 +1,83 @@
+# ============================================================================
+# API Gateway - Docker Profile Configuration
+# ============================================================================
+# This configuration is activated when SPRING_PROFILES_ACTIVE=docker
+# Optimized for containerized deployment with Docker Compose
+# ============================================================================
+
+spring:
+  application:
+    name: api-gateway
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    connection-timeout: 20s
+    max-connections: 10000
+
+# JWT Configuration
+jwt:
+  secret: ${JWT_SECRET:your-secret-key-change-in-production-min-256-bits-required}
+  expiration-ms: ${JWT_EXPIRATION_MS:3600000}
+
+# Workflow Service URL (Docker internal networking)
+workflow-service:
+  url: ${WORKFLOW_SERVICE_URL:http://workflow-service:8081}
+  connection-timeout: ${WORKFLOW_SERVICE_CONNECTION_TIMEOUT:5000}
+  read-timeout: ${WORKFLOW_SERVICE_READ_TIMEOUT:30000}
+
+# Actuator Configuration
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9080}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,env,loggers
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      service: api-gateway
+      environment: docker
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+      slo:
+        http.server.requests: 100ms,200ms,500ms,1s,2s,5s
+
+# Logging Configuration
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.web: ${LOGGING_LEVEL_WEB:INFO}
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:%wEx}"
+  file:
+    name: /app/logs/api-gateway.log
+    max-size: 100MB
+    max-history: 10
+    total-size-cap: 1GB
+
+# Spring Boot Lifecycle
+spring.lifecycle:
+  timeout-per-shutdown-phase: 30s

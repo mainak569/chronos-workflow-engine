@@ -1,0 +1,81 @@
+groups:
+  - name: chronos_alerts
+    interval: 30s
+    rules:
+      # Service availability alerts
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "{{ $labels.job }} has been down for more than 1 minute"
+
+      # MongoDB alerts
+      - alert: MongoDBDown
+        expr: mongodb_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB is down"
+          description: "MongoDB has been unavailable for more than 1 minute"
+
+      # Kafka alerts
+      - alert: KafkaDown
+        expr: kafka_server_replicamanager_leadercount == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka broker is down"
+          description: "Kafka broker has no leaders for more than 2 minutes"
+
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumer_lag > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High Kafka consumer lag"
+          description: "Consumer lag is above 1000 messages for more than 5 minutes"
+
+      # Redis alerts
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down"
+          description: "Redis has been unavailable for more than 1 minute"
+
+      # Worker alerts
+      - alert: NoWorkersAvailable
+        expr: worker_available_count == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No workers available"
+          description: "All workers are unavailable for more than 2 minutes"
+
+      # Task execution alerts
+      - alert: HighTaskFailureRate
+        expr: rate(task_failed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High task failure rate"
+          description: "Task failure rate is above 10% for more than 5 minutes"
+
+      - alert: TasksInDeadLetterQueue
+        expr: task_dead_total > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tasks accumulating in dead letter queue"
+          description: "More than 10 tasks in dead letter queue"

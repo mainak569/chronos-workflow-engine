@@ -1,0 +1,158 @@
+# ============================================================================
+# Scheduler Service - Docker Profile Configuration
+# ============================================================================
+# This configuration is activated when SPRING_PROFILES_ACTIVE=docker
+# Optimized for containerized deployment with Docker Compose
+# ============================================================================
+
+spring:
+  application:
+    name: scheduler-service
+  
+  # MongoDB Configuration (Docker internal networking)
+  data:
+    mongodb:
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@mongodb:27017/chronos?authSource=admin}
+      database: ${MONGODB_DATABASE:chronos}
+      auto-index-creation: true
+    
+    # Redis Configuration (Docker internal networking)
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+        shutdown-timeout: 100ms
+  
+  # Kafka Configuration (Docker internal networking)
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      acks: all
+      retries: 3
+      properties:
+        retry.backoff.ms: 1000
+        max.in.flight.requests.per.connection: 5
+        enable.idempotence: true
+        compression.type: snappy
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      group-id: scheduler-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      properties:
+        spring.json.trusted.packages: "*"
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+        max.poll.records: 100
+
+# Server Configuration
+server:
+  port: ${SERVER_PORT:8082}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    connection-timeout: 20s
+    max-connections: 10000
+
+# Scheduler Configuration
+scheduler:
+  id: ${SCHEDULER_ID:scheduler-${HOSTNAME:unknown}}
+  leader:
+    lock-key: "chronos:scheduler:leader:lock"
+    lock-ttl-seconds: ${SCHEDULER_LEADER_TTL_SECONDS:30}
+    renewal-interval-seconds: ${SCHEDULER_LEADER_RENEWAL_SECONDS:10}
+  worker-health-check:
+    interval-seconds: ${WORKER_HEALTH_CHECK_INTERVAL:15}
+    heartbeat-ttl-seconds: ${WORKER_HEARTBEAT_TTL:30}
+
+# Chronos Scheduler Configuration
+chronos:
+  scheduler:
+    # Leader Election
+    leader-election:
+      ttl: ${SCHEDULER_LEADER_TTL:30s}
+      renewal-interval: ${SCHEDULER_LEADER_RENEWAL:10000}
+      acquisition-retry: ${SCHEDULER_LEADER_RETRY:5s}
+    
+    # Scheduling
+    scheduling:
+      interval: ${SCHEDULER_INTERVAL:5000}
+      batch-size: ${SCHEDULER_BATCH_SIZE:100}
+      enabled: ${SCHEDULER_ENABLED:true}
+    
+    # Execution Idempotency
+    execution-idempotency:
+      ttl: ${EXECUTION_IDEMPOTENCY_TTL:1h}
+    
+    # Restart Recovery
+    restart-recovery:
+      enabled: ${RECOVERY_ENABLED:true}
+      task-republish-delay: ${RECOVERY_REPUBLISH_DELAY:1m}
+  
+  # Distributed Lock Configuration
+  lock:
+    task-lock-ttl: ${TASK_LOCK_TTL:5m}
+    task-lock-prefix: "chronos:lock:task:"
+    execution-lock-prefix: "chronos:lock:execution:"
+    cleanup-interval: ${LOCK_CLEANUP_INTERVAL:1m}
+    orphaned-lock-threshold: ${ORPHANED_LOCK_THRESHOLD:10m}
+    max-retry-attempts: ${LOCK_MAX_RETRY_ATTEMPTS:3}
+    retry-delay: ${LOCK_RETRY_DELAY:100ms}
+
+# Actuator Configuration
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9082}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,env,loggers
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      service: scheduler
+      environment: docker
+
+# Logging Configuration (JSON format for container logs)
+logging:
+  level:
+    root: ${LOGGING_LEVEL_ROOT:INFO}
+    com.chronos: ${LOGGING_LEVEL_COM_CHRONOS:DEBUG}
+    org.springframework.data.mongodb: ${LOGGING_LEVEL_MONGODB:INFO}
+    org.springframework.data.redis: ${LOGGING_LEVEL_REDIS:INFO}
+    org.springframework.kafka: ${LOGGING_LEVEL_KAFKA:INFO}
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:%wEx}"
+  file:
+    name: /app/logs/scheduler-service.log
+    max-size: 100MB
+    max-history: 10
+    total-size-cap: 1GB
+
+# Spring Boot Lifecycle
+spring.lifecycle:
+  timeout-per-shutdown-phase: 30s
