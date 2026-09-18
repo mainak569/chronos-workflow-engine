@@ -52,7 +52,7 @@ echo "Checking documentation..."
 check_dir "docs" || ((errors++))
 check_file "docs/architecture.md" || ((errors++))
 check_file "docs/design-decisions.md" || ((errors++))
-check_file "docs/failure-scenarios.md" || ((errors++))
+check_file "docs/failure-recovery-guarantees.md" || ((errors++))
 
 echo ""
 echo "Checking API Gateway..."

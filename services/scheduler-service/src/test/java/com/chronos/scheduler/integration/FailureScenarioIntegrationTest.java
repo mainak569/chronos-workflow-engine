@@ -3,12 +3,15 @@ package com.chronos.scheduler.integration;
 import com.chronos.scheduler.domain.SchedulerState;
 import com.chronos.scheduler.idempotency.ExecutionIdempotencyService;
 import com.chronos.scheduler.repository.SchedulerStateRepository;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.PortBinding;
+import com.github.dockerjava.api.model.Ports;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -18,6 +21,9 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.ServerSocket;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.TimeUnit;
@@ -44,24 +50,53 @@ import static org.awaitility.Awaitility.await;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class FailureScenarioIntegrationTest {
 
+    // Fixed host ports: restarting a container must not change the address the application uses
+    private static final int MONGO_PORT = freePort();
+    private static final int REDIS_PORT = freePort();
+
     @Container
     static MongoDBContainer mongoDBContainer = new MongoDBContainer("mongo:7.0")
-            .withExposedPorts(27017);
+            .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig().withPortBindings(
+                    new PortBinding(Ports.Binding.bindPort(MONGO_PORT), ExposedPort.tcp(27017))));
 
     @Container
     static GenericContainer<?> redisContainer = new GenericContainer<>(DockerImageName.parse("redis:7.2-alpine"))
             .withExposedPorts(6379)
-            .withCommand("redis-server");
+            .withCommand("redis-server")
+            .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig().withPortBindings(
+                    new PortBinding(Ports.Binding.bindPort(REDIS_PORT), ExposedPort.tcp(6379))));
+
+    private static int freePort() {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Stop and start the same container (keeping its data and port), unlike
+     * Testcontainers' stop()/start() which creates a brand new container.
+     */
+    private static void restart(GenericContainer<?> container) throws InterruptedException {
+        container.getDockerClient().stopContainerCmd(container.getContainerId()).exec();
+        Thread.sleep(2000);
+        container.getDockerClient().startContainerCmd(container.getContainerId()).exec();
+    }
 
     @DynamicPropertySource
     static void setProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.data.mongodb.uri", mongoDBContainer::getReplicaSetUrl);
+        // Short driver timeouts so operations against a paused container fail fast instead of hanging
+        registry.add("spring.data.mongodb.uri", () -> mongoDBContainer.getReplicaSetUrl()
+                + "?serverSelectionTimeoutMS=3000&connectTimeoutMS=3000&socketTimeoutMS=3000");
         registry.add("spring.data.redis.host", redisContainer::getHost);
         registry.add("spring.data.redis.port", redisContainer::getFirstMappedPort);
-        
-        // Configure timeouts for faster failure detection in tests
-        registry.add("spring.data.mongodb.connection-timeout", () -> "2000");
         registry.add("spring.data.redis.timeout", () -> "2000");
+        
+        // No Kafka broker in this test, and no background scheduling touching the test data
+        registry.add("chronos.kafka.listener.auto-startup", () -> "false");
+        registry.add("chronos.scheduler.scheduling.enabled", () -> "false");
+        registry.add("chronos.scheduler.restart-recovery.enabled", () -> "false");
     }
 
     @Autowired
@@ -187,13 +222,8 @@ class FailureScenarioIntegrationTest {
         String savedId = state.getId();
         
         // When: MongoDB container is stopped and restarted
-        System.out.println("Stopping MongoDB container...");
-        mongoDBContainer.stop();
-        
-        Thread.sleep(2000);
-        
-        System.out.println("Starting MongoDB container...");
-        mongoDBContainer.start();
+        System.out.println("Restarting MongoDB container...");
+        restart(mongoDBContainer);
         
         // Then: Data should persist (MongoDB uses volume)
         await().atMost(Duration.ofSeconds(30))
@@ -228,7 +258,7 @@ class FailureScenarioIntegrationTest {
             // Then: Operations should fail with timeout
             assertThatThrownBy(() -> {
                 redisTemplate.opsForValue().get("test-key");
-            }).isInstanceOf(RedisConnectionFailureException.class);
+            }).isInstanceOf(DataAccessException.class);
             
         } finally {
             // Cleanup: Unpause Redis
@@ -263,9 +293,7 @@ class FailureScenarioIntegrationTest {
         
         // When: Redis container is restarted
         System.out.println("Restarting Redis container...");
-        redisContainer.stop();
-        Thread.sleep(2000);
-        redisContainer.start();
+        restart(redisContainer);
         
         // Then: Data should persist (Redis AOF/RDB)
         await().atMost(Duration.ofSeconds(15))
@@ -524,13 +552,11 @@ class FailureScenarioIntegrationTest {
         // When: Containers are restarted (simulating service deployment)
         System.out.println("Restarting containers...");
         
-        // MongoDB restart
-        mongoDBContainer.stop();
-        mongoDBContainer.start();
+        // Force Redis to write its snapshot before the restart
+        redisTemplate.getConnectionFactory().getConnection().serverCommands().save();
         
-        // Redis restart
-        redisContainer.stop();
-        redisContainer.start();
+        restart(mongoDBContainer);
+        restart(redisContainer);
         
         // Then: MongoDB data should persist (with proper configuration)
         await().atMost(Duration.ofSeconds(30))
@@ -541,9 +567,11 @@ class FailureScenarioIntegrationTest {
         SchedulerState recovered = schedulerStateRepository.findById(mongoId).orElseThrow();
         assertThat(recovered.getWorkflowId()).isEqualTo("workflow-restart-test");
         
-        // Redis data might be lost (depends on persistence config)
-        String redisValue = redisTemplate.opsForValue().get("restart-test-key");
-        System.out.println("Redis value after restart: " + redisValue);
-        // Document: Configure Redis AOF for production to maintain data across restarts
+        // Redis: the snapshot written above survives the restart, once the client has reconnected
+        await().atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofMillis(500))
+                .ignoreExceptions()
+                .untilAsserted(() -> assertThat(redisTemplate.opsForValue().get("restart-test-key"))
+                        .isEqualTo("restart-test-value"));
     }
 }

@@ -614,68 +614,57 @@ Would add ELK for centralized logging. But for Chronos, Prometheus + Grafana is 
 
 ---
 
-## 17. Why No Workflow Cancellation (Initially)?
+## 17. Workflow Cancellation: Cooperative, Not Preemptive
 
 ### Decision
-Chronos does NOT support workflow cancellation in the initial implementation.
+Cancellation marks the execution `CANCELLED` and stops scheduling; it does **not** interrupt tasks
+that are already running.
 
-### Problem
-Cancellation is complex in distributed systems:
-1. Worker may be executing a task right now
-2. Need to interrupt task execution
-3. Need to transition all PENDING/READY tasks to CANCELLED
-4. Need to handle partial cancellation (task completes after cancel signal)
+### How It Works
+1. Client: `POST /api/v1/workflows/executions/{id}/cancel` (only the owner; `409` if already finished)
+2. Workflow service: execution → `CANCELLED`, every non-terminal task → `CANCELLED`
+3. Scheduler: never dispatches tasks of a finished execution
+4. A task that was already running finishes on its worker; its result is ignored because the task
+   is already in a terminal state
 
-### Why Deferred?
-- Core functionality (execute, retry, recover) is more important
-- Cancellation can be added later as an enhancement
-- Simplifies initial implementation
+### Why Not Interrupt Workers?
+- Task code may not be interruptible (external calls, long-running work)
+- Interrupting mid-task risks leaving side effects half-done; letting the attempt finish is simpler
+  and safe because results are ignored
+- Race conditions (a task completing just as the cancel arrives) are resolved by the task state
+  machine: the first terminal status wins
 
-### Future Implementation
-```text
-1. Client: POST /api/v1/executions/{id}/cancel
-2. Workflow Service: Mark execution as CANCELLING
-3. Publish WorkflowCancelling event
-4. Scheduler: Stop publishing new TaskReady events
-5. Workers: Attempt to interrupt in-progress tasks
-6. Transition to CANCELLED
-```
-
-**Challenges**:
-- Workers may not be interruptible (long-running task)
-- Race conditions (task completes just as cancel signal arrives)
+### Trade-Offs
+- 🟢 **Simple and race-free**: no cancel protocol between scheduler and workers
+- 🔴 **Wasted work**: a running task keeps using its worker until it finishes
 
 ---
 
-## 18. Why No Cron Scheduling (Initially)?
+## 18. Cron Scheduling in the Scheduler Service
 
 ### Decision
-Chronos does NOT support cron-based scheduling (e.g., "run this workflow every day at 2am").
+Workflows can carry an optional cron `schedule` (Spring 6-field format) and `timezone`; the leader
+scheduler starts executions automatically. No Quartz: the existing leader election, idempotency
+store and outbox already provide what is needed.
 
-### Problem
-Cron scheduling requires:
-1. Background job to evaluate cron expressions
-2. Execution history (prevent duplicate runs)
-3. Time zone handling
-4. Scheduler restart recovery (did I miss a scheduled run?)
+### How It Works
+1. Every 15s the leader syncs `scheduler_state` from workflows that have a schedule (new, changed and
+   deleted schedules)
+2. Every 5s it finds due entries (`nextScheduledTime <= now`)
+3. For each due slot it reserves an execution ID in Redis keyed by workflow + scheduled second, so a
+   retried or duplicated run of the same slot reuses the same execution
+4. It inserts the task executions, then the workflow execution, and dispatches ready tasks through
+   the outbox
+5. It advances `nextScheduledTime` last (optimistic locking on `scheduler_state`)
 
-### Why Deferred?
-- Manual workflow execution demonstrates the core distributed-system concepts
-- Cron scheduling is orthogonal to the main learning goals
-- Can be added later with Quartz or similar
+### Restart Recovery
+Because the state is advanced last and the slot's execution ID is reserved first, a crash at any
+point re-runs the same slot idempotently. Missed slots while all schedulers were down are skipped:
+the next run is computed from the current time.
 
-### Future Implementation
-```java
-@Scheduled(cron = "0 0 2 * * ?") // Every day at 2am
-public void triggerScheduledWorkflows() {
-    List<Workflow> scheduled = workflowRepository.findByCronScheduleNotNull();
-    for (Workflow workflow : scheduled) {
-        if (shouldExecute(workflow)) {
-            workflowService.executeWorkflow(workflow.getId());
-        }
-    }
-}
-```
+### Trade-Offs
+- 🟢 **No extra infrastructure**: reuses leader election, Redis and the outbox
+- 🔴 **Minimum granularity** is bounded by the 5s scheduling scan
 
 ---
 

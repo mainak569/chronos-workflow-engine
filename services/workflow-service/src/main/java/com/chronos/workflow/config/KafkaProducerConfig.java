@@ -30,6 +30,9 @@ public class KafkaProducerConfig {
         config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        // Consumers live in other services with their own event classes, so don't send
+        // __TypeId__ headers naming this service's classes (they cannot be loaded there)
+        config.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
         
         // Idempotence for exactly-once semantics
         config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);

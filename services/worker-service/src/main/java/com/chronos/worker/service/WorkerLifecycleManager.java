@@ -9,13 +9,12 @@ import com.chronos.worker.shutdown.GracefulShutdownManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
-import jakarta.annotation.PreDestroy;
 import java.util.List;
-import java.util.UUID;
 
 /**
  * Manages worker lifecycle: registration on startup and deregistration on shutdown.
@@ -30,7 +29,8 @@ public class WorkerLifecycleManager {
     private final WorkerEventPublisher eventPublisher;
     private final GracefulShutdownManager shutdownManager;
     
-    @Value("${worker.id:#{null}}")
+    // Resolved once per process by WorkerIdEnvironmentPostProcessor, so every component agrees
+    @Value("${worker.id}")
     private String workerId;
     
     @Value("${worker.supported-task-types}")
@@ -60,13 +60,10 @@ public class WorkerLifecycleManager {
         }
         
         try {
-            // Generate worker ID if not configured
-            if (workerId == null || workerId.isEmpty()) {
-                workerId = "worker-" + UUID.randomUUID().toString();
-                log.info("Generated worker ID: {}", workerId);
-            }
-            
             // Validate configuration
+            if (workerId == null || workerId.isBlank()) {
+                throw new IllegalStateException("Worker ID must not be blank");
+            }
             if (supportedTaskTypes == null || supportedTaskTypes.isEmpty()) {
                 throw new IllegalStateException("Worker must support at least one task type");
             }
@@ -99,16 +96,16 @@ public class WorkerLifecycleManager {
             
         } catch (Exception e) {
             log.error("Failed to register worker", e);
-            throw new RuntimeException("Worker registration failed", e);
+            throw new RuntimeException("Worker registration failed: " + e.getMessage(), e);
         }
     }
     
     /**
      * Gracefully deregister worker on shutdown.
-     * Publishes WorkerUnavailable event before deregistration.
-     * Waits for in-flight tasks via GracefulShutdownManager.
+     * Runs when the context starts closing, while Redis and Kafka are still available:
+     * waits for in-flight tasks, then publishes WorkerUnavailable and deregisters.
      */
-    @PreDestroy
+    @EventListener(ContextClosedEvent.class)
     public void onShutdown() {
         if (!registered) {
             log.debug("Worker not registered, skipping deregistration");
@@ -118,7 +115,9 @@ public class WorkerLifecycleManager {
         try {
             log.info("Gracefully shutting down worker: {}", workerId);
             
-            // Get current task stats
+            // Stop accepting tasks and wait for in-flight tasks, so the scheduler
+            // doesn't requeue tasks this worker is about to finish
+            shutdownManager.shutdown();
             GracefulShutdownManager.ShutdownStatistics stats = shutdownManager.getStatistics();
             log.info("Shutdown stats: {}", stats);
             
@@ -132,19 +131,16 @@ public class WorkerLifecycleManager {
                     .build();
             eventPublisher.publishWorkerUnavailable(unavailableEvent);
             
-            // GracefulShutdownManager will wait for in-flight tasks
-            // (triggered by its own @PreDestroy, which runs after this due to Spring ordering)
-            
-            // Deregister from registry
+// Deregister from registry
             workerRegistry.deregisterWorker(workerId);
-            
-            registered = false;
             
             log.info("Worker shutdown complete: {}", workerId);
             
         } catch (Exception e) {
             log.error("Error during worker shutdown", e);
             // Continue shutdown even if deregistration fails
+        } finally {
+            registered = false;
         }
     }
     

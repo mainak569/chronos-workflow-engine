@@ -7,8 +7,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import org.springframework.data.redis.core.script.RedisScript;
 
-import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -35,7 +36,7 @@ class LeaderElectionServiceTest {
     
     @BeforeEach
     void setUp() {
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         
         // Create service with test scheduler ID
         leaderElectionService = new LeaderElectionService(redisTemplate, SCHEDULER_ID);
@@ -146,26 +147,23 @@ class LeaderElectionServiceTest {
     
     @Test
     void testRenewLeadership_WhenLeader() {
-        // Given: This scheduler is the leader
-        when(valueOperations.get(LEADER_KEY)).thenReturn(SCHEDULER_ID + ":timestamp");
+        // Given: The renewal script confirms this scheduler holds leadership
+        when(redisTemplate.execute(any(RedisScript.class), eq(List.of(LEADER_KEY)),
+                eq(SCHEDULER_ID), contains(SCHEDULER_ID), anyString())).thenReturn(1L);
         
         // When: Renew leadership
         boolean renewed = leaderElectionService.renewLeadership();
         
-        // Then: Leadership renewed
+        // Then: Leadership renewed without trying to acquire
         assertThat(renewed).isTrue();
-        verify(valueOperations).set(
-                eq(LEADER_KEY),
-                contains(SCHEDULER_ID),
-                anyLong(),
-                eq(TimeUnit.MILLISECONDS)
-        );
+        verify(valueOperations, never()).setIfAbsent(anyString(), anyString(), anyLong(), any());
     }
     
     @Test
     void testRenewLeadership_WhenNotLeader() {
         // Given: Another scheduler is the leader
-        when(valueOperations.get(LEADER_KEY)).thenReturn("other-scheduler:timestamp");
+        when(redisTemplate.execute(any(RedisScript.class), eq(List.of(LEADER_KEY)),
+                eq(SCHEDULER_ID), anyString(), anyString())).thenReturn(0L);
         when(valueOperations.setIfAbsent(
                 eq(LEADER_KEY),
                 anyString(),
@@ -184,13 +182,15 @@ class LeaderElectionServiceTest {
     void testReleaseLeadership_WhenLeader() {
         // Given: This scheduler is the leader
         when(valueOperations.get(LEADER_KEY)).thenReturn(SCHEDULER_ID + ":timestamp");
-        when(redisTemplate.delete(LEADER_KEY)).thenReturn(true);
+        when(redisTemplate.execute(any(RedisScript.class), eq(List.of(LEADER_KEY)), eq(SCHEDULER_ID)))
+                .thenReturn(1L);
         
         // When: Release leadership
         leaderElectionService.releaseLeadership();
         
-        // Then: Leadership released
-        verify(redisTemplate).delete(LEADER_KEY);
+        // Then: Leadership released atomically (compare-and-delete script, not a blind DELETE)
+        verify(redisTemplate).execute(any(RedisScript.class), eq(List.of(LEADER_KEY)), eq(SCHEDULER_ID));
+        verify(redisTemplate, never()).delete(LEADER_KEY);
     }
     
     @Test
@@ -203,6 +203,19 @@ class LeaderElectionServiceTest {
         
         // Then: Does not delete (not the leader)
         verify(redisTemplate, never()).delete(LEADER_KEY);
+        verify(redisTemplate, never()).execute(any(RedisScript.class), anyList(), any());
+    }
+    
+    @Test
+    void testIsLeader_SchedulerIdWithColons() {
+        // Given: A scheduler ID that itself contains ':' (e.g. host:port)
+        LeaderElectionService service = new LeaderElectionService(redisTemplate, "host:8082");
+        when(valueOperations.get(LEADER_KEY)).thenReturn("host:8082:2026-09-17T10:00:00Z");
+        
+        // Then: Recognised as leader; a different ID sharing the prefix is not
+        assertThat(service.isLeader()).isTrue();
+        when(valueOperations.get(LEADER_KEY)).thenReturn("host:80821:2026-09-17T10:00:00Z");
+        assertThat(service.isLeader()).isFalse();
     }
     
     @Test

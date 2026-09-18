@@ -29,7 +29,9 @@ public class User {
     /**
      * User's email address (unique, used for login).
      */
-    @Indexed(unique = true)
+    // Name matches MongoDB's default ("email_1") so it does not clash with indexes
+    // created outside the application (e.g. by an older init-mongo.js)
+    @Indexed(name = "email_1", unique = true)
     private String email;
     
     /**

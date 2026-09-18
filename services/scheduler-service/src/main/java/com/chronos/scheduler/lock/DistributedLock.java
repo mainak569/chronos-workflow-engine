@@ -54,4 +54,12 @@ public interface DistributedLock {
      * @return true if the lock is currently held, false otherwise
      */
     boolean isLocked(String lockKey);
+    
+    /**
+     * Release a lock only if its value starts with the given owner prefix
+     * (e.g. "workerId:" for tokens of the form "workerId:uuid").
+     *
+     * @return true if the lock was held by that owner and has been released
+     */
+    boolean releaseIfOwnedBy(String lockKey, String ownerPrefix);
 }

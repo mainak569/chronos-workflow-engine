@@ -24,14 +24,13 @@ import java.util.concurrent.TimeUnit;
  * TTL: 1 hour (longer than max execution time)
  * 
  * Example:
- * Key: chronos:execution:idempotency:workflow-123:2026-09-15T10:00
- * Value: exec-456
+ * Key: chronos:execution:idempotency:workflow-123:2026-09-15T10:00:00
+* Value: exec-456
  * TTL: 1 hour
  * 
  * Time Slot Format:
- * - Rounded to nearest minute for sub-hourly schedules
- * - Rounded to nearest hour for hourly+ schedules
- */
+ * - Truncated to the second (cron schedules have second precision, so every run gets its own slot)
+*/
 @Service
 public class ExecutionIdempotencyService {
     
@@ -39,12 +38,12 @@ public class ExecutionIdempotencyService {
     
     private static final String IDEMPOTENCY_KEY_PREFIX = "chronos:execution:idempotency:";
     private static final DateTimeFormatter TIME_SLOT_FORMATTER = 
-            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm").withZone(ZoneId.of("UTC"));
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss").withZone(ZoneId.of("UTC"));
     
     private final RedisTemplate<String, String> redisTemplate;
     
     @Value("${chronos.scheduler.execution-idempotency.ttl:1h}")
-    private Duration idempotencyTtl;
+    private Duration idempotencyTtl = Duration.ofHours(1);
     
     public ExecutionIdempotencyService(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
@@ -183,7 +182,7 @@ public class ExecutionIdempotencyService {
      * Build idempotency key from workflow ID and scheduled time.
      * 
      * Format: chronos:execution:idempotency:{workflowId}:{timeSlot}
-     * Example: chronos:execution:idempotency:workflow-123:2026-09-15T10:00
+     * Example: chronos:execution:idempotency:workflow-123:2026-09-15T10:00:00
      */
     private String buildIdempotencyKey(String workflowId, Instant scheduledTime) {
         String timeSlot = formatTimeSlot(scheduledTime);
@@ -192,14 +191,12 @@ public class ExecutionIdempotencyService {
     
     /**
      * Format time slot for idempotency key.
-     * Rounds to nearest minute (removes seconds/nanos).
-     * 
+     * Truncates to the second (removes nanos), matching cron's precision.
+     *
      * @param time instant to format
-     * @return formatted time slot (YYYY-MM-DDTHH:MM)
+     * @return formatted time slot (YYYY-MM-DDTHH:MM:SS)
      */
     private String formatTimeSlot(Instant time) {
-        // Round to nearest minute
-        Instant roundedTime = Instant.ofEpochSecond(time.getEpochSecond() / 60 * 60);
-        return TIME_SLOT_FORMATTER.format(roundedTime);
+        return TIME_SLOT_FORMATTER.format(Instant.ofEpochSecond(time.getEpochSecond()));
     }
 }

@@ -3,53 +3,59 @@ package com.chronos.scheduler.service;
 import com.chronos.scheduler.domain.ExecutionStatus;
 import com.chronos.scheduler.domain.SchedulerState;
 import com.chronos.scheduler.domain.TaskExecution;
+import com.chronos.scheduler.domain.WorkflowDefinition;
 import com.chronos.scheduler.domain.WorkflowExecution;
-import com.chronos.scheduler.event.TaskReadyEvent;
 import com.chronos.scheduler.idempotency.ExecutionIdempotencyService;
 import com.chronos.scheduler.leader.LeaderElectionService;
-import com.chronos.scheduler.outbox.OutboxService;
 import com.chronos.scheduler.repository.SchedulerStateRepository;
 import com.chronos.scheduler.repository.TaskExecutionRepository;
+import com.chronos.scheduler.repository.WorkflowDefinitionRepository;
 import com.chronos.scheduler.repository.WorkflowExecutionRepository;
+import org.bson.types.ObjectId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
- * Main workflow scheduling service.
+ * Cron-based workflow scheduling.
  * 
  * Responsibilities:
- * 1. Identify workflows ready to execute (based on schedule)
- * 2. Create workflow executions (with idempotency)
- * 3. Determine runnable tasks (no pending dependencies)
- * 4. Write TaskReady events to outbox (transactional)
- * 5. Update scheduler state (next execution time)
+ * 1. Keep scheduler_state in sync with workflows that have a cron schedule
+ * 2. Identify scheduled workflows that are due
+ * 3. Create workflow executions (with idempotency per workflow + scheduled time)
+ * 4. Dispatch runnable tasks through TaskDispatchService (outbox)
+ * 5. Advance the scheduler state to the next execution time
  * 
  * CRITICAL: Only executes when this instance is the elected leader.
  * Never uses local state - always checks Redis for leadership.
  * 
- * TRANSACTIONAL OUTBOX PATTERN:
- * Instead of publishing directly to Kafka (which is not atomic with MongoDB),
- * this service writes events to an outbox table in the same transaction.
- * OutboxPublisherService polls the outbox and publishes to Kafka separately.
- * 
- * This ensures atomicity: either both MongoDB write + outbox write succeed,
- * or neither does. No partial failures.
+ * Crash safety (MongoDB runs without multi-document transactions):
+ * - The execution ID for a time slot is reserved in Redis before anything is written,
+ *   so a retried slot reuses the same execution ID.
+ * - Task executions are inserted before the workflow execution; recovery only looks at
+ *   workflow executions, so a partially created execution is never dispatched and is
+ *   completed idempotently on the next attempt (duplicate inserts are ignored).
+ * - The scheduler state is advanced last, so a crash re-runs the same slot.
  * 
  * Concurrency Safety:
  * - Leader election ensures only one scheduler runs
- * - Optimistic locking prevents duplicate scheduling
+ * - Optimistic locking on scheduler state prevents duplicate scheduling
  * - Idempotency prevents duplicate executions
  */
 @Service
@@ -57,57 +63,109 @@ public class WorkflowScheduler {
     
     private static final Logger log = LoggerFactory.getLogger(WorkflowScheduler.class);
     
-    private static final String TASK_READY_TOPIC = "chronos.task.ready";
+    static final String SCHEDULER_TRIGGER = "scheduler";
     
     private final LeaderElectionService leaderElectionService;
     private final SchedulerStateRepository schedulerStateRepository;
+    private final WorkflowDefinitionRepository workflowDefinitionRepository;
     private final WorkflowExecutionRepository workflowExecutionRepository;
     private final TaskExecutionRepository taskExecutionRepository;
-    private final ExecutionOrchestrationService orchestrationService;
     private final ExecutionIdempotencyService idempotencyService;
-    private final OutboxService outboxService;
+    private final TaskDispatchService taskDispatchService;
     
     @Value("${scheduler.id}")
     private String schedulerId;
     
-    @Value("${chronos.scheduler.scheduling.batch-size:100}")
-    private int batchSize;
+    @Value("${chronos.scheduler.scheduling.enabled:true}")
+    private boolean schedulingEnabled = true;
     
     public WorkflowScheduler(
             LeaderElectionService leaderElectionService,
             SchedulerStateRepository schedulerStateRepository,
+            WorkflowDefinitionRepository workflowDefinitionRepository,
             WorkflowExecutionRepository workflowExecutionRepository,
             TaskExecutionRepository taskExecutionRepository,
-            ExecutionOrchestrationService orchestrationService,
             ExecutionIdempotencyService idempotencyService,
-            OutboxService outboxService) {
+            TaskDispatchService taskDispatchService) {
         this.leaderElectionService = leaderElectionService;
         this.schedulerStateRepository = schedulerStateRepository;
+        this.workflowDefinitionRepository = workflowDefinitionRepository;
         this.workflowExecutionRepository = workflowExecutionRepository;
         this.taskExecutionRepository = taskExecutionRepository;
-        this.orchestrationService = orchestrationService;
         this.idempotencyService = idempotencyService;
-        this.outboxService = outboxService;
+        this.taskDispatchService = taskDispatchService;
+    }
+    
+    /**
+     * Synchronise scheduler_state with workflow definitions:
+     * create state for newly scheduled workflows, update changed schedules and
+     * remove state of workflows that were deleted or are no longer scheduled.
+     */
+    @Scheduled(fixedDelayString = "${chronos.scheduler.scheduling.sync-interval:15000}")
+    public void syncSchedules() {
+        if (!schedulingEnabled || !leaderElectionService.isLeader()) {
+            return;
+        }
+        
+        try {
+            Instant now = Instant.now();
+            List<WorkflowDefinition> scheduled = workflowDefinitionRepository.findScheduled();
+            Set<String> scheduledIds = scheduled.stream().map(WorkflowDefinition::getId).collect(Collectors.toSet());
+            
+            for (WorkflowDefinition workflow : scheduled) {
+                String timezone = workflow.getTimezone() != null ? workflow.getTimezone() : "UTC";
+                SchedulerState state = schedulerStateRepository.findByWorkflowId(workflow.getId()).orElse(null);
+                
+                if (state == null) {
+                    state = SchedulerState.builder()
+                            .workflowId(workflow.getId())
+                            .schedule(workflow.getSchedule())
+                            .timezone(timezone)
+                            .enabled(true)
+                            .nextScheduledTime(calculateNextScheduleTime(workflow.getSchedule(), timezone, now))
+                            .build();
+                    saveState(state);
+                    log.info("Registered schedule: workflowId={}, cron='{}', timezone={}, next={}",
+                            workflow.getId(), workflow.getSchedule(), timezone, state.getNextScheduledTime());
+                } else if (!Objects.equals(state.getSchedule(), workflow.getSchedule())
+                        || !Objects.equals(state.getTimezone(), timezone)
+                        || !state.isEnabled()) {
+                    state.setSchedule(workflow.getSchedule());
+                    state.setTimezone(timezone);
+                    state.setEnabled(true);
+                    state.setNextScheduledTime(calculateNextScheduleTime(workflow.getSchedule(), timezone, now));
+                    saveState(state);
+                    log.info("Updated schedule: workflowId={}, cron='{}', timezone={}, next={}",
+                            workflow.getId(), workflow.getSchedule(), timezone, state.getNextScheduledTime());
+                }
+            }
+            
+            for (SchedulerState state : schedulerStateRepository.findAll()) {
+                if (!scheduledIds.contains(state.getWorkflowId())) {
+                    schedulerStateRepository.delete(state);
+                    log.info("Removed schedule of deleted/unscheduled workflow: workflowId={}", state.getWorkflowId());
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error synchronising workflow schedules", e);
+        }
     }
     
     /**
      * Main scheduling loop.
-     * Runs every 5 seconds to identify and trigger ready workflows.
-     * 
+     * Runs every 5 seconds (configurable).
      * Only executes if this instance is the leader.
      */
     @Scheduled(fixedDelayString = "${chronos.scheduler.scheduling.interval:5000}")
     public void scheduleWorkflows() {
-        // CRITICAL: Check leadership in Redis (not local state)
-        if (!leaderElectionService.isLeader()) {
-            log.trace("Not the leader, skipping scheduling");
+        if (!schedulingEnabled || !leaderElectionService.isLeader()) {
+            log.trace("Not the leader or scheduling disabled, skipping scheduling");
             return;
         }
         
         log.debug("Starting scheduling scan (schedulerId={})", schedulerId);
         
         try {
-            // Find workflows ready to execute
             Instant now = Instant.now();
             List<SchedulerState> readyWorkflows = schedulerStateRepository.findReadyToExecute(now);
             
@@ -118,27 +176,24 @@ public class WorkflowScheduler {
             
             log.info("Found {} workflows ready to execute", readyWorkflows.size());
             
-            // Process each workflow
             int scheduled = 0;
             int skipped = 0;
             int failed = 0;
             
             for (SchedulerState state : readyWorkflows) {
                 try {
-                    boolean success = scheduleWorkflow(state, now);
-                    if (success) {
+                    if (scheduleWorkflow(state, now)) {
                         scheduled++;
                     } else {
                         skipped++;
                     }
                 } catch (Exception e) {
                     failed++;
-                    log.error("Failed to schedule workflow: workflowId={}", 
-                            state.getWorkflowId(), e);
+                    log.error("Failed to schedule workflow: workflowId={}", state.getWorkflowId(), e);
                 }
             }
             
-            log.info("Scheduling scan complete: scheduled={}, skipped={}, failed={}", 
+            log.info("Scheduling scan complete: scheduled={}, skipped={}, failed={}",
                     scheduled, skipped, failed);
             
         } catch (Exception e) {
@@ -147,160 +202,138 @@ public class WorkflowScheduler {
     }
     
     /**
-     * Schedule a single workflow.
-     * 
-     * Steps:
-     * 1. Check idempotency (already executed this time slot?)
-     * 2. Create WorkflowExecution (or get existing)
-     * 3. Find runnable tasks
-     * 4. Write TaskReady events to outbox (transactional)
-     * 5. Update SchedulerState with next execution time
-     * 
-     * IMPORTANT: All database writes happen in one transaction.
-     * Events are written to outbox, not published directly to Kafka.
-     * 
-     * @param state scheduler state for workflow
-     * @param now current time
-     * @return true if scheduled, false if skipped (duplicate)
+     * Schedule a single workflow run for the state's next scheduled time.
+     *
+     * @return true if an execution was created/dispatched and the state advanced
      */
-    @Transactional
-    protected boolean scheduleWorkflow(SchedulerState state, Instant now) {
+    boolean scheduleWorkflow(SchedulerState state, Instant now) {
         String workflowId = state.getWorkflowId();
+        Instant slot = state.getNextScheduledTime();
         
-        log.info("Scheduling workflow: workflowId={}, lastExecution={}, nextScheduled={}",
-                workflowId, state.getLastExecutionTime(), state.getNextScheduledTime());
+        WorkflowDefinition workflow = workflowDefinitionRepository.findById(workflowId).orElse(null);
+        if (workflow == null || workflow.getTasks().isEmpty()) {
+            log.warn("Scheduled workflow no longer exists or has no tasks, disabling: workflowId={}", workflowId);
+            state.disable();
+            saveState(state);
+            return false;
+        }
+        
+        log.info("Scheduling workflow: workflowId={}, slot={}, lastExecution={}",
+                workflowId, slot, state.getLastExecutionTime());
+        
+        // Reserve the execution ID for this slot (no side effects inside the supplier)
+        String executionId = idempotencyService.getOrCreateExecution(
+                workflowId, slot, () -> new ObjectId().toHexString());
+        
+        createExecutionIfAbsent(executionId, workflow, slot);
+        int dispatched = taskDispatchService.dispatchReadyTasks(executionId);
+        
+        // Skip missed slots: the next run is computed from now
+        Instant nextScheduleTime = calculateNextScheduleTime(state.getSchedule(), state.getTimezone(), now);
+        state.markExecuted(executionId, ExecutionStatus.PENDING, nextScheduleTime, schedulerId);
         
         try {
-            // Step 1: Get or create execution with idempotency
-            String executionId = idempotencyService.getOrCreateExecution(
-                    workflowId,
-                    state.getNextScheduledTime(),
-                    () -> createWorkflowExecution(workflowId)
-            );
-            
-            // Step 2: Find runnable tasks
-            List<TaskExecution> runnableTasks = orchestrationService.getReadyTasks(executionId);
-            
-            if (runnableTasks.isEmpty()) {
-                log.warn("No runnable tasks for execution: workflowId={}, executionId={}",
-                        workflowId, executionId);
-            }
-            
-            // Step 3: Publish TaskReady events to outbox (transactional)
-            for (TaskExecution task : runnableTasks) {
-                writeTaskReadyToOutbox(task);
-            }
-            
-            // Step 4: Calculate next schedule time
-            Instant nextScheduleTime = calculateNextScheduleTime(
-                    state.getSchedule(),
-                    state.getTimezone(),
-                    now
-            );
-            
-            // Step 5: Update scheduler state with optimistic locking
-            state.markExecuted(executionId, ExecutionStatus.RUNNING, nextScheduleTime, schedulerId);
             schedulerStateRepository.save(state);
-            
-            log.info("Workflow scheduled successfully: workflowId={}, executionId={}, " +
-                            "runnableTasks={}, nextSchedule={}",
-                    workflowId, executionId, runnableTasks.size(), nextScheduleTime);
-            
-            return true;
-            
         } catch (OptimisticLockingFailureException e) {
-            // Another scheduler already processed this workflow
-            log.info("Workflow already scheduled by another instance: workflowId={}", workflowId);
+            log.info("Workflow schedule updated concurrently: workflowId={}", workflowId);
             return false;
+        }
+        
+        log.info("Workflow scheduled: workflowId={}, executionId={}, dispatchedTasks={}, nextSchedule={}",
+                workflowId, executionId, dispatched, nextScheduleTime);
+        return true;
+    }
+    
+    /**
+     * Create the execution and its task executions unless they already exist.
+     */
+    private void createExecutionIfAbsent(String executionId, WorkflowDefinition workflow, Instant slot) {
+        if (workflowExecutionRepository.existsById(executionId)) {
+            return;
+        }
+        
+        for (WorkflowDefinition.TaskSpec spec : workflow.getTasks()) {
+            TaskExecution task = TaskExecution.builder()
+                    .executionId(executionId)
+                    .workflowId(workflow.getId())
+                    .taskId(spec.getTaskId())
+                    .taskName(spec.getName())
+                    .taskType(spec.getTaskType())
+                    .status(ExecutionStatus.PENDING)
+                    .dependsOn(new ArrayList<>(spec.getDependencies()))
+                    .configuration(spec.getConfiguration())
+                    .input(new HashMap<>())
+                    .attemptNumber(1)
+                    .maxRetries(spec.getRetryConfig() != null && spec.getRetryConfig().getMaxAttempts() != null
+                            ? spec.getRetryConfig().getMaxAttempts() : 3)
+                    .retriable(true)
+                    .build();
+            task.setTimeoutMs(spec.getTimeoutMs());
+            if (spec.getRetryConfig() != null) {
+                task.setRetryInitialDelayMs(spec.getRetryConfig().getInitialDelayMs());
+                task.setRetryBackoffMultiplier(spec.getRetryConfig().getBackoffMultiplier());
+                task.setRetryMaxDelayMs(spec.getRetryConfig().getMaxDelayMs());
+            }
+            try {
+                taskExecutionRepository.insert(task);
+            } catch (DuplicateKeyException e) {
+                log.debug("Task execution already exists: executionId={}, taskId={}", executionId, spec.getTaskId());
+            }
+        }
+        
+        Map<String, Object> input = new HashMap<>();
+        input.put("scheduledTime", slot.toString());
+        
+        WorkflowExecution execution = WorkflowExecution.builder()
+                .id(executionId)
+                .workflowId(workflow.getId())
+                .workflowName(workflow.getName())
+                .ownerId(workflow.getOwnerId())
+                .triggeredBy(SCHEDULER_TRIGGER)
+                .status(ExecutionStatus.PENDING)
+                .input(input)
+                .build();
+        try {
+            workflowExecutionRepository.insert(execution);
+            log.info("Created scheduled execution: workflowId={}, executionId={}, tasks={}",
+                    workflow.getId(), executionId, workflow.getTasks().size());
+        } catch (DuplicateKeyException e) {
+            log.debug("Execution already exists: executionId={}", executionId);
         }
     }
     
-    /**
-     * Create a new workflow execution.
-     * 
-     * @param workflowId workflow identifier
-     * @return execution ID
-     */
-    private String createWorkflowExecution(String workflowId) {
-        String executionId = "exec-" + UUID.randomUUID().toString();
-        
-        // Create WorkflowExecution
-        WorkflowExecution execution = new WorkflowExecution();
-        execution.setId(executionId);
-        execution.setWorkflowId(workflowId);
-        execution.setStatus(ExecutionStatus.PENDING);
-        execution.setCreatedAt(Instant.now());
-        
-        workflowExecutionRepository.save(execution);
-        
-        log.info("Created workflow execution: workflowId={}, executionId={}", 
-                workflowId, executionId);
-        
-        // TODO: Create TaskExecution records from workflow definition
-        // For now, this assumes tasks are created elsewhere or exist
-        // In production, fetch workflow definition and create task executions
-        
-        return executionId;
-    }
-    
-    /**
-     * Write TaskReady event to outbox for later publishing.
-     * Called within a transaction to ensure atomicity.
-     * 
-     * @param task task execution to publish
-     */
-    private void writeTaskReadyToOutbox(TaskExecution task) {
-        TaskReadyEvent event = new TaskReadyEvent();
-        event.setEventId(UUID.randomUUID().toString());
-        event.setCorrelationId(task.getExecutionId());
-        event.setTimestamp(Instant.now());
-        event.setWorkflowId(task.getWorkflowId());
-        event.setExecutionId(task.getExecutionId());
-        event.setTaskId(task.getTaskId());
-        event.setTaskType(task.getTaskType());
-        event.setConfiguration(task.getConfiguration());
-        event.setMaxRetries(task.getMaxRetries());
-        
-        // Write to outbox instead of publishing directly
-        outboxService.createMessage(
-                TASK_READY_TOPIC,
-                task.getTaskId(),
-                event,
-                TaskReadyEvent.class.getName()
-        );
-        
-        log.info("Written TaskReady to outbox: executionId={}, taskId={}, eventId={}",
-                task.getExecutionId(), task.getTaskId(), event.getEventId());
+    private void saveState(SchedulerState state) {
+        try {
+            schedulerStateRepository.save(state);
+        } catch (OptimisticLockingFailureException | DuplicateKeyException e) {
+            log.debug("Scheduler state changed concurrently: workflowId={}", state.getWorkflowId());
+        }
     }
     
     /**
      * Calculate next schedule time based on cron expression.
      * 
-     * @param cronExpression cron expression (e.g., "0 * * * *")
-     * @param timezone timezone for evaluation
-     * @param fromTime time to calculate from
-     * @return next execution time
+     * @param cronExpression cron expression (Spring format with seconds)
+     * @param timezone timezone for cron evaluation
+     * @param fromTime calculate next time after this
+     * @return next scheduled time
      */
-    private Instant calculateNextScheduleTime(String cronExpression, String timezone, Instant fromTime) {
+    Instant calculateNextScheduleTime(String cronExpression, String timezone, Instant fromTime) {
         try {
             CronExpression cron = CronExpression.parse(cronExpression);
             ZoneId zoneId = ZoneId.of(timezone != null ? timezone : "UTC");
-            ZonedDateTime fromZoned = ZonedDateTime.ofInstant(fromTime, zoneId);
-            
-            ZonedDateTime next = cron.next(fromZoned);
+            ZonedDateTime next = cron.next(ZonedDateTime.ofInstant(fromTime, zoneId));
             
             if (next == null) {
                 log.warn("No next execution time for cron: {}", cronExpression);
-                // Fallback: schedule 1 hour from now
                 return fromTime.plus(java.time.Duration.ofHours(1));
             }
             
             return next.toInstant();
             
         } catch (Exception e) {
-            log.error("Error calculating next schedule time: cron={}, timezone={}", 
+            log.error("Error calculating next schedule time: cron={}, timezone={}",
                     cronExpression, timezone, e);
-            // Fallback: schedule 1 hour from now
             return fromTime.plus(java.time.Duration.ofHours(1));
         }
     }

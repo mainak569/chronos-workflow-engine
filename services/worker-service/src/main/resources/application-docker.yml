@@ -67,13 +67,8 @@ server:
 # Worker Configuration
 worker:
   id: ${WORKER_ID:worker-${HOSTNAME:unknown}}
-  supported-task-types:
-    - IMAGE_RESIZE
-    - IMAGE_COMPRESS
-    - DATA_PROCESSING
-    - DATA_VALIDATION
-    - FILE_CONVERSION
-    - NOTIFICATION
+  # Comma-separated (read via @Value, which cannot bind YAML lists)
+  supported-task-types: ${WORKER_SUPPORTED_TASK_TYPES:IMAGE_RESIZE,IMAGE_COMPRESS,DATA_PROCESSING,DATA_VALIDATION,FILE_CONVERSION,NOTIFICATION}
   heartbeat:
     interval-seconds: ${WORKER_HEARTBEAT_INTERVAL:10}
     ttl-seconds: ${WORKER_HEARTBEAT_TTL:30}

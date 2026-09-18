@@ -20,6 +20,7 @@ public class TaskReadyEvent {
     private Map<String, Object> configuration;
     private Long timeoutMs;
     private Integer maxRetries;
+    private Integer attemptNumber;
 
     // Constructors
     public TaskReadyEvent() {
@@ -122,6 +123,14 @@ public class TaskReadyEvent {
         this.maxRetries = maxRetries;
     }
 
+    public Integer getAttemptNumber() {
+        return attemptNumber;
+    }
+
+    public void setAttemptNumber(Integer attemptNumber) {
+        this.attemptNumber = attemptNumber;
+    }
+
     // Builder
     public static Builder builder() {
         return new Builder();
@@ -138,6 +147,7 @@ public class TaskReadyEvent {
         private Map<String, Object> configuration;
         private Long timeoutMs;
         private Integer maxRetries;
+        private Integer attemptNumber;
 
         public Builder eventId(String eventId) {
             this.eventId = eventId;
@@ -189,10 +199,17 @@ public class TaskReadyEvent {
             return this;
         }
 
+        public Builder attemptNumber(Integer attemptNumber) {
+            this.attemptNumber = attemptNumber;
+            return this;
+        }
+
         public TaskReadyEvent build() {
-            return new TaskReadyEvent(eventId, correlationId, timestamp,
+            TaskReadyEvent event = new TaskReadyEvent(eventId, correlationId, timestamp,
                     workflowId, executionId, taskId, taskType, configuration,
                     timeoutMs, maxRetries);
+            event.setAttemptNumber(attemptNumber);
+            return event;
         }
     }
 

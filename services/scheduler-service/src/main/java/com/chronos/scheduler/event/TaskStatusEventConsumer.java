@@ -1,8 +1,8 @@
 package com.chronos.scheduler.event;
 
 import com.chronos.scheduler.config.KafkaTopics;
-import com.chronos.scheduler.domain.TaskExecution;
 import com.chronos.scheduler.service.ExecutionOrchestrationService;
+import com.chronos.scheduler.service.TaskDispatchService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -12,11 +12,12 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
-
 /**
- * Consumer for task status events from workers.
- * Handles TaskCompletedEvent and TaskFailedEvent to update workflow execution state.
+ * Consumer for task status events published by workers.
+ * Updates task/execution state and dispatches tasks that became ready.
+ *
+ * Exceptions propagate to the container error handler, which retries and finally
+ * sends the record to the dead-letter topic.
  */
 @Component
 public class TaskStatusEventConsumer {
@@ -24,23 +25,45 @@ public class TaskStatusEventConsumer {
     private static final Logger log = LoggerFactory.getLogger(TaskStatusEventConsumer.class);
 
     private final ExecutionOrchestrationService orchestrationService;
-    private final TaskEventPublisher taskEventPublisher;
+    private final TaskDispatchService taskDispatchService;
 
     public TaskStatusEventConsumer(
             ExecutionOrchestrationService orchestrationService,
-            TaskEventPublisher taskEventPublisher) {
+            TaskDispatchService taskDispatchService) {
         this.orchestrationService = orchestrationService;
-        this.taskEventPublisher = taskEventPublisher;
+        this.taskDispatchService = taskDispatchService;
     }
 
     /**
-     * Handle TaskCompletedEvent.
-     * Updates task status and schedules dependent tasks if ready.
-     *
-     * @param event The task completed event
-     * @param partition Kafka partition
-     * @param offset Kafka offset
-     * @param acknowledgment Manual acknowledgment handle
+     * Handle TaskStartedEvent: mark the task as RUNNING.
+     */
+    @KafkaListener(
+            topics = KafkaTopics.TASK_STARTED,
+            groupId = "${spring.kafka.consumer.group-id}",
+            containerFactory = "taskStartedKafkaListenerContainerFactory"
+    )
+    public void handleTaskStarted(
+            @Payload TaskStartedEvent event,
+            @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+            @Header(KafkaHeaders.OFFSET) long offset,
+            Acknowledgment acknowledgment) {
+
+        log.info("Received TaskStartedEvent: executionId={}, taskId={}, workerId={}, attempt={}, partition={}, offset={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(),
+                event.getAttemptNumber(), partition, offset);
+
+        orchestrationService.markTaskAsRunning(
+                event.getExecutionId(),
+                event.getTaskId(),
+                event.getWorkerId(),
+                event.getAttemptNumber()
+        );
+
+        acknowledgment.acknowledge();
+    }
+
+    /**
+     * Handle TaskCompletedEvent: mark the task as COMPLETED and dispatch downstream tasks.
      */
     @KafkaListener(
             topics = KafkaTopics.TASK_COMPLETED,
@@ -53,67 +76,29 @@ public class TaskStatusEventConsumer {
             @Header(KafkaHeaders.OFFSET) long offset,
             Acknowledgment acknowledgment) {
 
-        log.info("Received TaskCompletedEvent: executionId={}, taskId={}, workerId={}, eventId={}, partition={}, offset={}",
-                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), 
-                event.getEventId(), partition, offset);
+        log.info("Received TaskCompletedEvent: executionId={}, taskId={}, workerId={}, attempt={}, durationMs={}, partition={}, offset={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(),
+                event.getAttemptNumber(), event.getDurationMs(), partition, offset);
 
-        try {
-            // Idempotency check: verify we haven't processed this event before
-            // In production, check Redis/MongoDB for processed eventId
-            // For now, we'll process optimistically
-            
-            // Update task execution state to COMPLETED
-            orchestrationService.markTaskAsCompleted(
-                    event.getExecutionId(),
-                    event.getTaskId(),
-                    event.getResult()
-            );
-            
-            log.info("Marked task as completed: executionId={}, taskId={}, durationMs={}",
-                    event.getExecutionId(), event.getTaskId(), event.getDurationMs());
-            
-            // Check if dependent tasks are now ready to execute
-            List<TaskExecution> readyTasks = orchestrationService.getReadyTasks(event.getExecutionId());
-            
-            log.info("Found {} newly ready tasks after completion: executionId={}, taskId={}", 
-                    readyTasks.size(), event.getExecutionId(), event.getTaskId());
-            
-            // Publish TaskReadyEvent for each newly ready task
-            for (TaskExecution task : readyTasks) {
-                TaskReadyEvent taskReadyEvent = TaskReadyEvent.builder()
-                        .correlationId(event.getCorrelationId())
-                        .workflowId(event.getWorkflowId())
-                        .executionId(event.getExecutionId())
-                        .taskId(task.getTaskId())
-                        .taskType(task.getTaskType())
-                        .configuration(task.getConfiguration())
-                        .build();
+        orchestrationService.markTaskAsCompleted(
+                event.getExecutionId(),
+                event.getTaskId(),
+                event.getWorkerId(),
+                event.getAttemptNumber(),
+                event.getResult()
+        );
 
-                log.info("Publishing TaskReadyEvent for downstream task: executionId={}, taskId={}", 
-                        event.getExecutionId(), task.getTaskId());
-                taskEventPublisher.publishTaskReady(taskReadyEvent);
-            }
-            
-            log.info("Successfully processed TaskCompletedEvent: executionId={}, taskId={}, newReadyTasks={}",
-                    event.getExecutionId(), event.getTaskId(), readyTasks.size());
+        int dispatched = taskDispatchService.dispatchReadyTasks(event.getExecutionId());
 
-            acknowledgment.acknowledge();
+        log.info("Processed TaskCompletedEvent: executionId={}, taskId={}, newlyDispatched={}",
+                event.getExecutionId(), event.getTaskId(), dispatched);
 
-        } catch (Exception e) {
-            log.error("Error processing TaskCompletedEvent: executionId={}, taskId={}, error={}",
-                    event.getExecutionId(), event.getTaskId(), e.getMessage(), e);
-            throw new RuntimeException("Failed to process TaskCompletedEvent", e);
-        }
+        acknowledgment.acknowledge();
     }
 
     /**
-     * Handle TaskFailedEvent.
-     * Updates task status and determines retry or failure propagation.
-     *
-     * @param event The task failed event
-     * @param partition Kafka partition
-     * @param offset Kafka offset
-     * @param acknowledgment Manual acknowledgment handle
+     * Handle TaskFailedEvent: schedule a retry or fail the task (and with it the execution).
+     * Retries are dispatched by the recovery sweep once their backoff has elapsed.
      */
     @KafkaListener(
             topics = KafkaTopics.TASK_FAILED,
@@ -126,51 +111,20 @@ public class TaskStatusEventConsumer {
             @Header(KafkaHeaders.OFFSET) long offset,
             Acknowledgment acknowledgment) {
 
-        log.info("Received TaskFailedEvent: executionId={}, taskId={}, workerId={}, retriable={}, eventId={}, partition={}, offset={}",
-                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), 
-                event.isRetriable(), event.getEventId(), partition, offset);
+        log.info("Received TaskFailedEvent: executionId={}, taskId={}, workerId={}, attempt={}, retriable={}, error={}, partition={}, offset={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), event.getAttemptNumber(),
+                event.isRetriable(), event.getErrorMessage(), partition, offset);
 
-        try {
-            // Idempotency check: verify we haven't processed this event before
-            // In production, check Redis/MongoDB for processed eventId
-            // For now, we'll process optimistically
-            
-            // Update task execution state to FAILED
-            orchestrationService.markTaskAsFailed(
-                    event.getExecutionId(),
-                    event.getTaskId(),
-                    event.getErrorMessage(),
-                    event.getErrorType(),
-                    event.isRetriable()
-            );
-            
-            log.info("Marked task as failed: executionId={}, taskId={}, retriable={}, attempt={}",
-                    event.getExecutionId(), event.getTaskId(), event.isRetriable(), event.getAttemptNumber());
-            
-            // Determine retry logic
-            // Note: The task state is already marked as FAILED
-            // Retry logic would require resetting state to PENDING or implementing a separate retry mechanism
-            // For now, we just log and let the workflow fail if task is not retriable
-            
-            if (!event.isRetriable()) {
-                log.warn("Task failed permanently (not retriable): executionId={}, taskId={}, attempts={}",
-                        event.getExecutionId(), event.getTaskId(), event.getAttemptNumber());
-                // Workflow execution status will be updated by updateExecutionStatus() in orchestrationService
-            } else {
-                log.info("Task failed but is retriable: executionId={}, taskId={}, attempts={}",
-                        event.getExecutionId(), event.getTaskId(), event.getAttemptNumber());
-                // Future: Implement retry mechanism with exponential backoff
-            }
+        orchestrationService.markTaskAsFailed(
+                event.getExecutionId(),
+                event.getTaskId(),
+                event.getWorkerId(),
+                event.getAttemptNumber(),
+                event.getErrorMessage(),
+                event.getErrorType(),
+                event.isRetriable()
+        );
 
-            log.info("Successfully processed TaskFailedEvent: executionId={}, taskId={}",
-                    event.getExecutionId(), event.getTaskId());
-
-            acknowledgment.acknowledge();
-
-        } catch (Exception e) {
-            log.error("Error processing TaskFailedEvent: executionId={}, taskId={}, error={}",
-                    event.getExecutionId(), event.getTaskId(), e.getMessage(), e);
-            throw new RuntimeException("Failed to process TaskFailedEvent", e);
-        }
+        acknowledgment.acknowledge();
     }
 }

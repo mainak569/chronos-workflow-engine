@@ -142,9 +142,9 @@ main() {
     
     echo ""
     print_info "Checking application services..."
-    check_service_health "API Gateway" "http://localhost:8080/actuator/health" 5 || true
-    check_service_health "Workflow Service" "http://localhost:8081/actuator/health" 5 || true
-    check_service_health "Scheduler Service" "http://localhost:8082/actuator/health" 5 || true
+    check_service_health "API Gateway" "http://localhost:8080/readyz" 5 || true
+    check_service_health "Workflow Service" "http://localhost:8081/readyz" 5 || true
+    check_service_health "Scheduler Service" "http://localhost:8082/readyz" 5 || true
     
     # Check at least one worker
     if docker ps --format '{{.Names}}' | grep -q "worker-service"; then
@@ -152,7 +152,7 @@ main() {
         local worker_container=$(docker ps --format '{{.Names}}' | grep "worker-service" | head -n 1)
         local worker_port=$(docker port "$worker_container" 8083 2>/dev/null | cut -d: -f2)
         if [ -n "$worker_port" ]; then
-            check_service_health "Worker Service" "http://localhost:${worker_port}/actuator/health" 5 || true
+            check_service_health "Worker Service" "http://localhost:${worker_port}/readyz" 5 || true
         else
             print_warning "Worker service port not exposed, checking container status only"
             check_container_running "$worker_container" || true

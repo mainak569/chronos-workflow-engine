@@ -16,6 +16,8 @@ public class WorkflowResponse {
     private String name;
     private String description;
     private List<TaskDefinition> tasks;
+    private String schedule;
+    private String timezone;
     private Instant createdAt;
     private Instant updatedAt;
     
@@ -35,6 +37,22 @@ public class WorkflowResponse {
     }
     
     // Getters and Setters
+
+    public String getSchedule() {
+        return schedule;
+    }
+
+    public void setSchedule(String schedule) {
+        this.schedule = schedule;
+    }
+
+    public String getTimezone() {
+        return timezone;
+    }
+
+    public void setTimezone(String timezone) {
+        this.timezone = timezone;
+    }
     public String getWorkflowId() {
         return workflowId;
     }
@@ -152,7 +170,7 @@ public class WorkflowResponse {
      * @return Response DTO
      */
     public static WorkflowResponse from(Workflow workflow) {
-        return WorkflowResponse.builder()
+        WorkflowResponse response = WorkflowResponse.builder()
                 .workflowId(workflow.getId())
                 .ownerId(workflow.getOwnerId())
                 .name(workflow.getName())
@@ -161,5 +179,8 @@ public class WorkflowResponse {
                 .createdAt(workflow.getCreatedAt())
                 .updatedAt(workflow.getUpdatedAt())
                 .build();
+        response.setSchedule(workflow.getSchedule());
+        response.setTimezone(workflow.getTimezone());
+        return response;
     }
 }

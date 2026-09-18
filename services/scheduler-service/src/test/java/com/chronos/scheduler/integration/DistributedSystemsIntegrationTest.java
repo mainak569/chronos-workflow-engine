@@ -74,7 +74,9 @@ class DistributedSystemsIntegrationTest {
         // Short intervals for faster testing
         registry.add("chronos.scheduler.leader-election.ttl", () -> "5s");
         registry.add("chronos.scheduler.leader-election.renewal-interval", () -> "2000");
-        registry.add("chronos.scheduler.scheduling-interval", () -> "1000");
+        // These tests drive scheduling state directly; keep background jobs from modifying it
+        registry.add("chronos.scheduler.scheduling.enabled", () -> "false");
+        registry.add("chronos.scheduler.restart-recovery.enabled", () -> "false");
     }
 
     @Autowired
@@ -186,6 +188,8 @@ class DistributedSystemsIntegrationTest {
         // Given: A workflow scheduled multiple times with same execution ID
         String workflowId = "workflow-123";
         String executionId = "exec-456";
+        // One fixed scheduled slot: idempotency is per workflow + scheduled time
+        Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
         int attemptCount = 5;
         
         CountDownLatch startLatch = new CountDownLatch(1);
@@ -200,7 +204,7 @@ class DistributedSystemsIntegrationTest {
                 try {
                     startLatch.await();
                     
-                    boolean recorded = idempotencyService.recordExecution(workflowId, Instant.now(), executionId);
+                    boolean recorded = idempotencyService.recordExecution(workflowId, scheduledTime, executionId);
                     
                     if (recorded) {
                         successCount.incrementAndGet();
@@ -229,7 +233,7 @@ class DistributedSystemsIntegrationTest {
                 .isEqualTo(attemptCount - 1);
         
         // Verify idempotency check still works
-        boolean isDuplicate = idempotencyService.recordExecution(workflowId, Instant.now(), executionId);
+        boolean isDuplicate = idempotencyService.recordExecution(workflowId, scheduledTime, executionId);
         assertThat(isDuplicate)
                 .as("Subsequent checks should detect duplicate")
                 .isFalse();
@@ -509,9 +513,10 @@ class DistributedSystemsIntegrationTest {
                 .as("New scheduler should become leader")
                 .isTrue();
         
+        // The leader key stores "schedulerId:timestamp"
         assertThat(scheduler2.getCurrentLeader())
                 .as("New scheduler should be the current leader")
-                .hasValue(schedulerId2);
+                .hasValueSatisfying(value -> assertThat(value).startsWith(schedulerId2 + ":"));
     }
 
     @Test
@@ -555,11 +560,12 @@ class DistributedSystemsIntegrationTest {
     @DisplayName("Test Leader Election TTL - Leadership expires without renewal")
     void testLeaderElectionTTL() throws Exception {
         // Given: A scheduler with short TTL leadership
+        // (separate key: the application's own LeaderElectionService competes for the real one)
         String schedulerId = "scheduler-short-ttl";
         
         // Acquire leadership
         Boolean acquired = redisTemplate.opsForValue().setIfAbsent(
-                "chronos:scheduler:leader",
+                "chronos:test:leader:ttl",
                 schedulerId,
                 Duration.ofSeconds(2)
         );
@@ -570,14 +576,14 @@ class DistributedSystemsIntegrationTest {
         Thread.sleep(3000);
         
         // Then: Leadership should be available again
-        String currentLeader = redisTemplate.opsForValue().get("chronos:scheduler:leader");
+        String currentLeader = redisTemplate.opsForValue().get("chronos:test:leader:ttl");
         assertThat(currentLeader)
                 .as("Leadership should have expired")
                 .isNull();
         
         // Another scheduler can acquire
         Boolean reacquired = redisTemplate.opsForValue().setIfAbsent(
-                "chronos:scheduler:leader",
+                "chronos:test:leader:ttl",
                 "scheduler-new",
                 Duration.ofSeconds(30)
         );
@@ -599,7 +605,7 @@ class DistributedSystemsIntegrationTest {
         state = schedulerStateRepository.save(state);
         
         int threadCount = 20;
-        int attemptsPerThread = 5;
+        int attemptsPerThread = 100;
         CountDownLatch startLatch = new CountDownLatch(1);
         CountDownLatch finishLatch = new CountDownLatch(threadCount);
         
@@ -626,7 +632,7 @@ class DistributedSystemsIntegrationTest {
                             
                         } catch (OptimisticLockingFailureException e) {
                             totalFailures.incrementAndGet();
-                            Thread.sleep(10); // Small backoff
+                            Thread.sleep(5 + ThreadLocalRandom.current().nextInt(20)); // Jittered backoff
                         }
                     }
                 } catch (Exception e) {

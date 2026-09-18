@@ -16,7 +16,7 @@ Triggered when a user creates a new workflow definition.
 
 **Fields:**
 - `eventId` (String): Unique event identifier (UUID)
-- `correlationId` (String): Workflow ID for tracing
+- `correlationId` (String): Execution ID for tracing
 - `timestamp` (Instant): Event creation time
 - `workflowId` (String): Workflow identifier
 - `ownerId` (String): User who created the workflow
@@ -42,10 +42,12 @@ Triggered when a task is ready to execute (dependencies satisfied).
 - `taskId` (String): Task identifier within workflow
 - `taskType` (String): Task type for worker matching
 - `configuration` (Map<String, Object>): Task-specific config
-- `timeoutMs` (Long): Maximum execution time
-- `maxRetries` (Integer): Maximum retry attempts
+- `timeoutMs` (Long): Maximum execution time of this attempt (enforced by the worker)
+- `maxRetries` (Integer): Maximum number of attempts
+- `attemptNumber` (Integer): Attempt being dispatched (1-based); results for older attempts are ignored
 
-**Purpose:** Signals workers that a task is available for execution.
+**Purpose:** Signals workers that a task attempt is available for execution. Each attempt is dispatched
+once (atomic claim in MongoDB) through the transactional outbox.
 
 ---
 
@@ -147,7 +149,7 @@ Triggered when a worker shuts down or becomes unresponsive.
 - `workerId` (String): Worker identifier
 - `reason` (String): Unavailability reason (shutdown, timeout, crash)
 
-**Purpose:** Removes worker from registry and reschedules in-progress tasks.
+**Purpose:** Published by a worker on graceful shutdown; the scheduler requeues any tasks still RUNNING on it.
 
 ---
 
@@ -158,24 +160,33 @@ Triggered when a worker shuts down or becomes unresponsive.
 
 ### Main Topics
 
-| Topic Name | Partitions | Replication | Retention | Description |
-|------------|------------|-------------|-----------|-------------|
-| `chronos.workflow.created` | 6 | 3 | 7 days | Workflow creation events |
-| `chronos.task.ready` | 12 | 3 | 3 days | Tasks ready for execution |
-| `chronos.task.started` | 12 | 3 | 3 days | Task execution started |
-| `chronos.task.completed` | 12 | 3 | 7 days | Task completion events |
-| `chronos.task.failed` | 12 | 3 | 30 days | Task failure events (longer retention for debugging) |
-| `chronos.worker.registered` | 3 | 3 | 1 day | Worker registration |
-| `chronos.worker.unavailable` | 3 | 3 | 7 days | Worker unavailability |
+Topics are auto-created by the broker. In the local Docker stack every topic has **6 partitions,
+replication factor 1 and 24h retention** (`KAFKA_NUM_PARTITIONS`, `KAFKA_LOG_RETENTION_HOURS` in
+`docker-compose.yml`). The last column is a suggested production setting.
+
+| Topic Name | Producer → Consumer | Key | Suggested production retention |
+|------------|---------------------|-----|------------------|
+| `chronos.workflow.created` | workflow service → scheduler | executionId | 7 days |
+| `chronos.task.ready` | scheduler (outbox) → workers | executionId | 3 days |
+| `chronos.task.started` | worker → scheduler | executionId | 3 days |
+| `chronos.task.completed` | worker → scheduler | executionId | 7 days |
+| `chronos.task.failed` | worker → scheduler | executionId | 30 days |
+| `chronos.task.failed.permanently` | worker → (operators) | executionId | 30 days — the task dead letter queue |
+| `chronos.worker.registered` | worker → scheduler | workerId | 1 day |
+| `chronos.worker.unavailable` | worker → scheduler | workerId | 7 days |
+
+In production use replication factor 3 and `min.insync.replicas=2` (producers already use `acks=all`
+and idempotence).
 
 ### Dead Letter Topics (DLT)
 
-| Topic Name | Retention | Description |
-|------------|-----------|-------------|
-| `chronos.workflow.created.dlt` | 30 days | Failed workflow event processing |
-| `chronos.task.ready.dlt` | 30 days | Failed task ready processing |
-| `chronos.task.status.dlt` | 30 days | Failed task status processing |
-| `chronos.worker.status.dlt` | 30 days | Failed worker status processing |
+When a consumer keeps failing on a record (3 retries, 1s apart) or cannot deserialize it, the record is
+published to **`<original topic>.dlt`** with the exception in its headers
+(`kafka_dlt-exception-message`, `kafka_dlt-exception-stacktrace`), and the partition moves on. For example
+`chronos.task.ready.dlt` (worker side) or `chronos.task.completed.dlt` (scheduler side).
+
+A dead-lettered `TaskReady` leaves its task dispatched but not started; the scheduler's stale-dispatch
+sweep re-dispatches it after the dispatch timeout (5 minutes).
 
 ---
 
@@ -200,8 +211,8 @@ Triggered when a worker shuts down or becomes unresponsive.
 
 ### Partition Count Selection
 
-- **Workflow topics (6 partitions):** Lower volume, workflow-level parallelism
-- **Task topics (12 partitions):** Higher volume, task-level parallelism
+- **Local stack:** every topic is auto-created with 6 partitions
+- **Production suggestion:** workflow topics 6 partitions (lower volume), task topics 12 (task-level parallelism)
 - **Worker topics (3 partitions):** Lower volume, limited by worker count
 
 **Scaling considerations:**
@@ -217,13 +228,15 @@ Triggered when a worker shuts down or becomes unresponsive.
 **Service:** scheduler-service  
 **Consumes:**
 - `chronos.workflow.created`
+- `chronos.task.started`
 - `chronos.task.completed`
 - `chronos.task.failed`
 - `chronos.worker.registered`
 - `chronos.worker.unavailable`
 
-**Concurrency:** 3 consumers per topic (matches partition count)  
-**Purpose:** Single scheduler instance processes all workflow orchestration
+**Concurrency:** 3 consumer threads per task/workflow topic, 2 per worker topic  
+**Purpose:** All scheduler instances share the work through the group; handlers are idempotent and
+use optimistic locking, so any instance can process any event (only background jobs are leader-only)
 
 **Configuration:**
 - `group.id`: `scheduler-group`
@@ -447,4 +460,4 @@ kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
 - Kafka Consumer Config: https://kafka.apache.org/documentation/#consumerconfigs
 - Spring Kafka Documentation: https://docs.spring.io/spring-kafka/reference/html/
 - Chronos Architecture: `docs/architecture.md`
-- Failure Scenarios: `docs/failure-scenarios.md`
+- Failure Scenarios: `docs/failure-recovery-guarantees.md`

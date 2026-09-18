@@ -5,6 +5,10 @@ global:
     cluster: 'chronos-local'
     environment: 'development'
 
+# Alert rules (mounted by docker-compose); firing alerts are visible at http://localhost:9090/alerts
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   # API Gateway
   - job_name: 'api-gateway'

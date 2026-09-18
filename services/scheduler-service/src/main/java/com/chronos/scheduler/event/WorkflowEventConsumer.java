@@ -1,8 +1,7 @@
 package com.chronos.scheduler.event;
 
 import com.chronos.scheduler.config.KafkaTopics;
-import com.chronos.scheduler.domain.TaskExecution;
-import com.chronos.scheduler.service.ExecutionOrchestrationService;
+import com.chronos.scheduler.service.TaskDispatchService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -12,35 +11,26 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Component;
 
-import java.util.List;
-
 /**
  * Consumer for workflow lifecycle events.
- * Handles WorkflowCreatedEvent to initiate workflow execution planning.
+ * Handles WorkflowCreatedEvent by dispatching the execution's initial runnable tasks.
  */
 @Component
 public class WorkflowEventConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(WorkflowEventConsumer.class);
 
-    private final TaskEventPublisher taskEventPublisher;
-    private final ExecutionOrchestrationService orchestrationService;
+    private final TaskDispatchService taskDispatchService;
 
-    public WorkflowEventConsumer(
-            TaskEventPublisher taskEventPublisher,
-            ExecutionOrchestrationService orchestrationService) {
-        this.taskEventPublisher = taskEventPublisher;
-        this.orchestrationService = orchestrationService;
+    public WorkflowEventConsumer(TaskDispatchService taskDispatchService) {
+        this.taskDispatchService = taskDispatchService;
     }
 
     /**
      * Handle WorkflowCreatedEvent.
-     * Loads execution state from MongoDB and publishes TaskReadyEvents for tasks with satisfied dependencies.
-     *
-     * @param event The workflow created event
-     * @param partition Kafka partition
-     * @param offset Kafka offset
-     * @param acknowledgment Manual acknowledgment handle
+     * The workflow service has already stored the execution and its task executions;
+     * tasks without dependencies are dispatched here. Redelivery is harmless because
+     * each task attempt can only be dispatched once.
      */
     @KafkaListener(
             topics = KafkaTopics.WORKFLOW_CREATED,
@@ -56,47 +46,11 @@ public class WorkflowEventConsumer {
         log.info("Received WorkflowCreatedEvent: workflowId={}, executionId={}, eventId={}, partition={}, offset={}",
                 event.getWorkflowId(), event.getExecutionId(), event.getEventId(), partition, offset);
 
-        try {
-            // Idempotency check: verify we haven't processed this event before
-            // In production, check Redis/MongoDB for processed eventId
-            // For now, we'll process optimistically
-            
-            String executionId = event.getExecutionId();
-            
-            // Get ready tasks from execution state (dependency resolution)
-            List<TaskExecution> readyTasks = orchestrationService.getReadyTasks(executionId);
-            
-            log.info("Found {} ready tasks for executionId={}", readyTasks.size(), executionId);
-            
-            // Publish TaskReadyEvent for each ready task
-            for (TaskExecution task : readyTasks) {
-                TaskReadyEvent taskReadyEvent = TaskReadyEvent.builder()
-                        .correlationId(event.getCorrelationId())
-                        .workflowId(event.getWorkflowId())
-                        .executionId(executionId)
-                        .taskId(task.getTaskId())
-                        .taskType(task.getTaskType())
-                        .configuration(task.getConfiguration())
-                        .build();
+        int dispatched = taskDispatchService.dispatchReadyTasks(event.getExecutionId());
 
-                log.info("Publishing TaskReadyEvent: executionId={}, taskId={}", 
-                        executionId, task.getTaskId());
-                taskEventPublisher.publishTaskReady(taskReadyEvent);
-            }
+        log.info("Processed WorkflowCreatedEvent: workflowId={}, executionId={}, dispatchedTasks={}",
+                event.getWorkflowId(), event.getExecutionId(), dispatched);
 
-            log.info("Successfully processed WorkflowCreatedEvent: workflowId={}, executionId={}, readyTasks={}",
-                    event.getWorkflowId(), executionId, readyTasks.size());
-
-            // Manual acknowledgment for at-least-once delivery
-            acknowledgment.acknowledge();
-
-        } catch (Exception e) {
-            log.error("Error processing WorkflowCreatedEvent: workflowId={}, executionId={}, eventId={}, error={}",
-                    event.getWorkflowId(), event.getExecutionId(), event.getEventId(), e.getMessage(), e);
-            
-            // Don't acknowledge - message will be redelivered
-            // After max retries, it will go to DLT if configured
-            throw new RuntimeException("Failed to process WorkflowCreatedEvent", e);
-        }
+        acknowledgment.acknowledge();
     }
 }

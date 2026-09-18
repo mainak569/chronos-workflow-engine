@@ -70,8 +70,8 @@ class AuthControllerIntegrationTest {
     void shouldRegisterNewUser() throws Exception {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "john@example.com",
+                "johndoe",
                 "SecurePass123!"
         );
 
@@ -116,8 +116,8 @@ class AuthControllerIntegrationTest {
         userRepository.save(existingUser);
 
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "john@example.com",
+                "johndoe",
                 "SecurePass123!"
         );
 
@@ -135,8 +135,8 @@ class AuthControllerIntegrationTest {
     void shouldRejectInvalidEmail() throws Exception {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "invalid-email", // Invalid email format
+                "johndoe",
                 "SecurePass123!"
         );
 
@@ -279,8 +279,8 @@ class AuthControllerIntegrationTest {
     void shouldNotStorePlaintextPasswords() throws Exception {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "secureuser",
                 "secure@example.com",
+                "secureuser",
                 "MySecretPassword123!"
         );
 

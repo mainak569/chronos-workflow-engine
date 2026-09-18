@@ -162,6 +162,26 @@ public class TaskExecution {
      */
     private Instant nextRetryAt;
     
+    /**
+     * Timestamp when the scheduler dispatched the current attempt (null if not yet dispatched).
+     * Written by the scheduler service.
+     */
+    private Instant dispatchedAt;
+
+    /**
+     * Retry backoff settings copied from the task definition's retry configuration.
+     * Null values fall back to the scheduler defaults.
+     */
+    private Long retryInitialDelayMs;
+    private Double retryBackoffMultiplier;
+    private Long retryMaxDelayMs;
+
+    /**
+     * Maximum execution time of one attempt in milliseconds (from the task definition).
+     * Workers abort attempts that exceed it and report a retriable timeout failure.
+     */
+    private Long timeoutMs;
+
     // Constructors
     public TaskExecution() {
     }
@@ -473,7 +493,47 @@ public class TaskExecution {
     public void setNextRetryAt(Instant nextRetryAt) {
         this.nextRetryAt = nextRetryAt;
     }
-    
+
+    public Instant getDispatchedAt() {
+        return dispatchedAt;
+    }
+
+    public void setDispatchedAt(Instant dispatchedAt) {
+        this.dispatchedAt = dispatchedAt;
+    }
+
+    public Long getRetryInitialDelayMs() {
+        return retryInitialDelayMs;
+    }
+
+    public void setRetryInitialDelayMs(Long retryInitialDelayMs) {
+        this.retryInitialDelayMs = retryInitialDelayMs;
+    }
+
+    public Double getRetryBackoffMultiplier() {
+        return retryBackoffMultiplier;
+    }
+
+    public void setRetryBackoffMultiplier(Double retryBackoffMultiplier) {
+        this.retryBackoffMultiplier = retryBackoffMultiplier;
+    }
+
+    public Long getRetryMaxDelayMs() {
+        return retryMaxDelayMs;
+    }
+
+    public void setRetryMaxDelayMs(Long retryMaxDelayMs) {
+        this.retryMaxDelayMs = retryMaxDelayMs;
+    }
+
+    public Long getTimeoutMs() {
+        return timeoutMs;
+    }
+
+    public void setTimeoutMs(Long timeoutMs) {
+        this.timeoutMs = timeoutMs;
+    }
+
     // Builder
     
     public static Builder builder() {

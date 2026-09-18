@@ -5,14 +5,18 @@ spring:
 server:
   port: 8080
 
-# JWT Configuration
+# JWT Configuration (must match workflow-service's secret, which issues the tokens)
 jwt:
-  secret: ${JWT_SECRET:default-secret-key-change-in-production-min-256-bits-required}
-  expiration-ms: ${JWT_EXPIRATION_MS:3600000}
+  secret: ${JWT_SECRET:changeme-this-is-not-secure-for-production-use-at-least-32-chars}
 
-# Workflow Service URL
-workflow-service:
-  url: ${WORKFLOW_SERVICE_URL:http://localhost:8081}
+# Routing and rate limiting
+gateway:
+  workflow-service-url: ${WORKFLOW_SERVICE_URL:http://localhost:8081}
+  connect-timeout: ${WORKFLOW_SERVICE_CONNECTION_TIMEOUT:5s}
+  read-timeout: ${WORKFLOW_SERVICE_READ_TIMEOUT:30s}
+  rate-limit:
+    enabled: ${GATEWAY_RATE_LIMIT_ENABLED:true}
+    requests-per-minute: ${GATEWAY_RATE_LIMIT_PER_MINUTE:120}
 
 # Logging
 logging:
@@ -33,6 +37,11 @@ management:
   endpoint:
     health:
       show-details: always
+      # Liveness/readiness groups, also served on the main server port as /livez and /readyz
+      # (actuator itself runs on a separate management port in the docker profile)
+      probes:
+        enabled: true
+        add-additional-paths: true
   metrics:
     export:
       prometheus:

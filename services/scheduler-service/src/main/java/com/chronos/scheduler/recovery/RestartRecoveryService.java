@@ -3,270 +3,167 @@ package com.chronos.scheduler.recovery;
 import com.chronos.scheduler.domain.ExecutionStatus;
 import com.chronos.scheduler.domain.TaskExecution;
 import com.chronos.scheduler.domain.WorkflowExecution;
-import com.chronos.scheduler.event.TaskReadyEvent;
+import com.chronos.scheduler.leader.LeaderElectionService;
 import com.chronos.scheduler.repository.TaskExecutionRepository;
 import com.chronos.scheduler.repository.WorkflowExecutionRepository;
+import com.chronos.scheduler.service.TaskDispatchService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
-import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 /**
- * Service for recovering workflow executions after scheduler restart or crash.
- * 
- * Recovery Process:
- * 1. Find in-progress workflow executions (RUNNING or PENDING)
- * 2. For each execution, find tasks that should be running
- * 3. Check if tasks have active leases (workers still processing)
- * 4. Republish TaskReady events for tasks that need recovery
- * 
- * Safety:
- * - Does not republish if task started recently (< 1 minute ago)
- * - Does not republish if task has active lease (worker still processing)
- * - Idempotent: safe to run multiple times
- * 
- * Triggered:
- * - Automatically on application startup
- * - Can be triggered manually via admin API
+ * Keeps workflow executions moving when events are delayed, lost or the scheduler restarts.
+ *
+ * Runs on the leader only:
+ * - Retry sweep (frequent): dispatches retry attempts whose backoff has elapsed.
+ * - Recovery sweep (periodic, and shortly after startup):
+ *   1. releases dispatch claims of attempts no worker picked up within the dispatch timeout
+ *      (TaskReady lost, dropped by a worker, or the scheduler crashed mid-dispatch)
+ *   2. dispatches ready tasks of all in-progress executions (e.g. a WorkflowCreated event was lost)
+ *
+ * Safety: dispatching is idempotent per task attempt, and workers de-duplicate with
+ * per-task locks, so running the sweeps repeatedly or concurrently with the event consumers is safe.
  */
 @Service
 public class RestartRecoveryService {
-    
+
     private static final Logger log = LoggerFactory.getLogger(RestartRecoveryService.class);
-    
-    private static final String TASK_READY_TOPIC = "chronos.task.ready";
-    
+
+    private static final int BATCH_SIZE = 500;
+
     private final WorkflowExecutionRepository workflowExecutionRepository;
     private final TaskExecutionRepository taskExecutionRepository;
-    private final KafkaTemplate<String, Object> kafkaTemplate;
-    
+    private final TaskDispatchService taskDispatchService;
+    private final LeaderElectionService leaderElectionService;
+
     @Value("${chronos.scheduler.restart-recovery.enabled:true}")
     private boolean recoveryEnabled;
-    
-    @Value("${chronos.scheduler.restart-recovery.task-republish-delay:1m}")
-    private Duration taskRepublishDelay;
-    
+
+    @Value("${chronos.scheduler.restart-recovery.dispatch-timeout:5m}")
+    private Duration dispatchTimeout;
+
     public RestartRecoveryService(
             WorkflowExecutionRepository workflowExecutionRepository,
             TaskExecutionRepository taskExecutionRepository,
-            KafkaTemplate<String, Object> kafkaTemplate) {
+            TaskDispatchService taskDispatchService,
+            LeaderElectionService leaderElectionService) {
         this.workflowExecutionRepository = workflowExecutionRepository;
         this.taskExecutionRepository = taskExecutionRepository;
-        this.kafkaTemplate = kafkaTemplate;
+        this.taskDispatchService = taskDispatchService;
+        this.leaderElectionService = leaderElectionService;
     }
-    
+
     /**
-     * Run recovery on application startup.
-     * Triggered after ApplicationContext is ready.
+     * Dispatch retry attempts whose backoff has elapsed.
      */
-    @EventListener(ApplicationReadyEvent.class)
-    public void recoverOnStartup() {
-        if (!recoveryEnabled) {
-            log.info("Restart recovery is disabled");
+    @Scheduled(fixedDelayString = "${chronos.scheduler.restart-recovery.retry-sweep-interval:2000}")
+    public void dispatchDueRetries() {
+        if (!recoveryEnabled || !leaderElectionService.isLeader()) {
             return;
         }
-        
-        log.info("Starting restart recovery");
-        
+        try {
+            List<TaskExecution> due = taskExecutionRepository.findRetriesDue(Instant.now(), PageRequest.of(0, BATCH_SIZE));
+            Set<String> executionIds = new LinkedHashSet<>();
+            due.forEach(task -> executionIds.add(task.getExecutionId()));
+            for (String executionId : executionIds) {
+                taskDispatchService.dispatchReadyTasks(executionId);
+            }
+        } catch (Exception e) {
+            log.error("Error dispatching due retries", e);
+        }
+    }
+
+    /**
+     * Periodic recovery sweep; the first run happens shortly after startup.
+     */
+    @Scheduled(
+            initialDelayString = "${chronos.scheduler.restart-recovery.initial-delay:15000}",
+            fixedDelayString = "${chronos.scheduler.restart-recovery.sweep-interval:60000}"
+    )
+    public void recoverScheduled() {
+        if (!recoveryEnabled || !leaderElectionService.isLeader()) {
+            return;
+        }
         try {
             RecoveryStats stats = performRecovery();
-            
-            log.info("Restart recovery completed: executionsFound={}, tasksRepublished={}, tasksSkipped={}",
-                    stats.executionsProcessed, stats.tasksRepublished, stats.tasksSkipped);
-            
+            if (stats.getStaleDispatchesReleased() > 0 || stats.getTasksDispatched() > 0) {
+                log.info("Recovery sweep completed: {}", stats);
+            } else {
+                log.debug("Recovery sweep completed: {}", stats);
+            }
         } catch (Exception e) {
-            log.error("Error during restart recovery", e);
+            log.error("Error during recovery sweep", e);
         }
     }
-    
+
     /**
-     * Perform recovery (can be called manually).
-     * 
-     * @return recovery statistics
+     * Perform a full recovery pass.
      */
     public RecoveryStats performRecovery() {
-        int executionsProcessed = 0;
-        int tasksRepublished = 0;
-        int tasksSkipped = 0;
-        
-        // Find in-progress workflow executions
-        List<WorkflowExecution> inProgressExecutions = workflowExecutionRepository
-                .findByStatusIn(List.of(ExecutionStatus.RUNNING, ExecutionStatus.PENDING));
-        
-        log.info("Found {} in-progress executions to recover", inProgressExecutions.size());
-        
-        for (WorkflowExecution execution : inProgressExecutions) {
+        int released = 0;
+        Instant cutoff = Instant.now().minus(dispatchTimeout);
+        for (TaskExecution task : taskExecutionRepository.findStaleDispatches(cutoff, PageRequest.of(0, BATCH_SIZE))) {
+            if (taskDispatchService.releaseStaleDispatch(task)) {
+                released++;
+                log.warn("Released stale dispatch: executionId={}, taskId={}, attempt={}, dispatchedAt={}",
+                        task.getExecutionId(), task.getTaskId(), task.getAttemptNumber(), task.getDispatchedAt());
+            }
+        }
+
+        List<WorkflowExecution> inProgress = workflowExecutionRepository
+                .findByStatusIn(List.of(ExecutionStatus.PENDING, ExecutionStatus.RUNNING));
+
+        int dispatched = 0;
+        for (WorkflowExecution execution : inProgress) {
             try {
-                RecoveryResult result = recoverExecution(execution);
-                executionsProcessed++;
-                tasksRepublished += result.tasksRepublished;
-                tasksSkipped += result.tasksSkipped;
-                
+                dispatched += taskDispatchService.dispatchReadyTasks(execution.getId());
             } catch (Exception e) {
-                log.error("Failed to recover execution: executionId={}", 
-                        execution.getId(), e);
+                log.error("Failed to recover execution: executionId={}", execution.getId(), e);
             }
         }
-        
-        return new RecoveryStats(executionsProcessed, tasksRepublished, tasksSkipped);
+
+        return new RecoveryStats(inProgress.size(), released, dispatched);
     }
-    
+
     /**
-     * Recover a single workflow execution.
-     * 
-     * @param execution workflow execution to recover
-     * @return recovery result
-     */
-    private RecoveryResult recoverExecution(WorkflowExecution execution) {
-        String executionId = execution.getId();
-        
-        log.info("Recovering execution: executionId={}, workflowId={}, status={}",
-                executionId, execution.getWorkflowId(), execution.getStatus());
-        
-        // Find tasks that might need republishing
-        List<TaskExecution> tasks = taskExecutionRepository.findByExecutionId(executionId);
-        
-        // Build dependency map
-        Map<String, TaskExecution> taskMap = tasks.stream()
-                .collect(Collectors.toMap(TaskExecution::getTaskId, t -> t));
-        
-        int republished = 0;
-        int skipped = 0;
-        
-        for (TaskExecution task : tasks) {
-            if (shouldRepublishTask(task, taskMap)) {
-                republishTaskReadyEvent(task);
-                republished++;
-            } else {
-                skipped++;
-                log.debug("Skipping task republish: executionId={}, taskId={}, status={}",
-                        executionId, task.getTaskId(), task.getStatus());
-            }
-        }
-        
-        log.info("Execution recovery complete: executionId={}, tasksRepublished={}, tasksSkipped={}",
-                executionId, republished, skipped);
-        
-        return new RecoveryResult(republished, skipped);
-    }
-    
-    /**
-     * Determine if a task should be republished.
-     * 
-     * Criteria:
-     * - Task is PENDING (not started yet)
-     * - Task dependencies are satisfied
-     * - Task did not start recently (avoid race with workers)
-     * - Task does not have active lease (worker not processing)
-     * 
-     * @param task task to check
-     * @param allTasks map of all tasks for dependency checking
-     * @return true if task should be republished
-     */
-    private boolean shouldRepublishTask(TaskExecution task, Map<String, TaskExecution> allTasks) {
-        // Only republish PENDING tasks
-        if (task.getStatus() != ExecutionStatus.PENDING) {
-            return false;
-        }
-        
-        // Check if dependencies are satisfied
-        if (!task.areDependenciesSatisfied(allTasks)) {
-            log.debug("Task dependencies not satisfied: taskId={}", task.getTaskId());
-            return false;
-        }
-        
-        // Don't republish if task started very recently (possible race with worker)
-        if (task.getStartedAt() != null) {
-            Duration timeSinceStart = Duration.between(task.getStartedAt(), Instant.now());
-            if (timeSinceStart.compareTo(taskRepublishDelay) < 0) {
-                log.debug("Task started recently, not republishing: taskId={}, startedAt={}",
-                        task.getTaskId(), task.getStartedAt());
-                return false;
-            }
-        }
-        
-        // TODO: Check if task has active lease (requires TaskLeaseService integration)
-        // For now, we rely on the time-since-start check above
-        
-        return true;
-    }
-    
-    /**
-     * Republish TaskReady event for a task.
-     * 
-     * @param task task to republish
-     */
-    private void republishTaskReadyEvent(TaskExecution task) {
-        TaskReadyEvent event = new TaskReadyEvent();
-        event.setEventId(UUID.randomUUID().toString());
-        event.setCorrelationId(task.getExecutionId());
-        event.setTimestamp(Instant.now());
-        event.setWorkflowId(task.getWorkflowId());
-        event.setExecutionId(task.getExecutionId());
-        event.setTaskId(task.getTaskId());
-        event.setTaskType(task.getTaskType());
-        event.setConfiguration(task.getConfiguration());
-        event.setMaxRetries(task.getMaxRetries());
-        
-        kafkaTemplate.send(TASK_READY_TOPIC, task.getTaskId(), event);
-        
-        log.info("Republished TaskReady event after recovery: executionId={}, taskId={}, eventId={}",
-                task.getExecutionId(), task.getTaskId(), event.getEventId());
-    }
-    
-    /**
-     * Recovery statistics.
+     * Statistics for a recovery pass.
      */
     public static class RecoveryStats {
         private final int executionsProcessed;
-        private final int tasksRepublished;
-        private final int tasksSkipped;
-        
-        public RecoveryStats(int executionsProcessed, int tasksRepublished, int tasksSkipped) {
+        private final int staleDispatchesReleased;
+        private final int tasksDispatched;
+
+        public RecoveryStats(int executionsProcessed, int staleDispatchesReleased, int tasksDispatched) {
             this.executionsProcessed = executionsProcessed;
-            this.tasksRepublished = tasksRepublished;
-            this.tasksSkipped = tasksSkipped;
+            this.staleDispatchesReleased = staleDispatchesReleased;
+            this.tasksDispatched = tasksDispatched;
         }
-        
+
         public int getExecutionsProcessed() {
             return executionsProcessed;
         }
-        
-        public int getTasksRepublished() {
-            return tasksRepublished;
+
+        public int getStaleDispatchesReleased() {
+            return staleDispatchesReleased;
         }
-        
-        public int getTasksSkipped() {
-            return tasksSkipped;
+
+        public int getTasksDispatched() {
+            return tasksDispatched;
         }
-        
+
         @Override
         public String toString() {
-            return String.format("RecoveryStats{executionsProcessed=%d, tasksRepublished=%d, tasksSkipped=%d}",
-                    executionsProcessed, tasksRepublished, tasksSkipped);
-        }
-    }
-    
-    /**
-     * Recovery result for a single execution.
-     */
-    private static class RecoveryResult {
-        private final int tasksRepublished;
-        private final int tasksSkipped;
-        
-        public RecoveryResult(int tasksRepublished, int tasksSkipped) {
-            this.tasksRepublished = tasksRepublished;
-            this.tasksSkipped = tasksSkipped;
+            return String.format("RecoveryStats{executionsProcessed=%d, staleDispatchesReleased=%d, tasksDispatched=%d}",
+                    executionsProcessed, staleDispatchesReleased, tasksDispatched);
         }
     }
 }

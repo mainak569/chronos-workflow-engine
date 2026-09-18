@@ -106,7 +106,7 @@ services:
       KAFKA_MESSAGE_MAX_BYTES: 10485760
       
       # JVM settings
-      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xmx512M -Xms512M}
     volumes:
       - kafka_data:/var/lib/kafka/data
     networks:
@@ -137,7 +137,7 @@ services:
       --auto-aof-rewrite-percentage 100
       --auto-aof-rewrite-min-size 64mb
       --maxmemory 256mb
-      --maxmemory-policy allkeys-lru
+      --maxmemory-policy noeviction
       --save 900 1
       --save 300 10
       --save 60 10000
@@ -250,6 +250,7 @@ services:
       - "${API_GATEWAY_PORT:-8080}:8080"
     environment:
       WORKFLOW_SERVICE_URL: http://workflow-service:8081
+      GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-120}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production-min-256-bits-required}
       JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
       LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
@@ -257,7 +258,8 @@ services:
     networks:
       - chronos-network
     healthcheck:
-      test: wget --quiet --tries=1 --spider http://localhost:8080/actuator/health || exit 1
+      # Actuator runs on the management port in the docker profile
+      test: wget --quiet --tries=1 --spider http://localhost:9080/actuator/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
@@ -286,12 +288,15 @@ services:
       MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-chronos}:${MONGODB_ROOT_PASSWORD:-chronos123}@mongodb:27017/${MONGODB_DATABASE:-chronos}?authSource=admin
       MONGODB_DATABASE: ${MONGODB_DATABASE:-chronos}
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production-min-256-bits-required}
+      JWT_EXPIRATION_MS: ${JWT_EXPIRATION_MS:-3600000}
       LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
       LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
     networks:
       - chronos-network
     healthcheck:
-      test: wget --quiet --tries=1 --spider http://localhost:8081/actuator/health || exit 1
+      # Actuator runs on the management port in the docker profile
+      test: wget --quiet --tries=1 --spider http://localhost:9081/actuator/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
@@ -324,12 +329,15 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Enables the admin API (/api/locks) when set; send it as X-Admin-Token
+      CHRONOS_ADMIN_TOKEN: ${CHRONOS_ADMIN_TOKEN:-}
       LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
       LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
     networks:
       - chronos-network
     healthcheck:
-      test: wget --quiet --tries=1 --spider http://localhost:8082/actuator/health || exit 1
+      # Actuator runs on the management port in the docker profile
+      test: wget --quiet --tries=1 --spider http://localhost:9082/actuator/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
@@ -361,13 +369,14 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      WORKER_ID: worker-${HOSTNAME:-unknown}
+      # WORKER_ID is not set: each replica defaults to worker-<container hostname>
       LOGGING_LEVEL_ROOT: ${LOGGING_LEVEL_ROOT:-INFO}
       LOGGING_LEVEL_COM_CHRONOS: ${LOGGING_LEVEL_COM_CHRONOS:-DEBUG}
     networks:
       - chronos-network
     healthcheck:
-      test: wget --quiet --tries=1 --spider http://localhost:8083/actuator/health || exit 1
+      # Actuator runs on the management port in the docker profile
+      test: wget --quiet --tries=1 --spider http://localhost:9083/actuator/health || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
@@ -378,7 +387,7 @@ services:
         max-size: "10m"
         max-file: "3"
     deploy:
-      replicas: 3
+      replicas: ${WORKER_REPLICAS:-3}
 
 # ============================================================================
 # Networks

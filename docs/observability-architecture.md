@@ -1,920 +1,129 @@
-# Chronos Observability Architecture
+# Observability
 
-## Overview
-Complete observability solution for distributed workflow orchestration with metrics, logging, tracing, and visualization.
+Chronos exposes Prometheus metrics from every service, ships a provisioned Grafana dashboard and a
+set of Prometheus alert rules. Everything here is part of the root `docker-compose.yml`.
 
-**Date**: September 16, 2026  
-**Status**: Implementation Complete
+| Component | URL | Notes |
+|---|---|---|
+| Grafana | http://localhost:3000/d/chronos-overview | `admin` / `admin` (from `.env`) |
+| Prometheus | http://localhost:9090 | Targets: `/targets`, alerts: `/alerts` |
+| Service metrics | `http://<service>:908x/actuator/prometheus` | Management ports, inside the Docker network |
+| Readiness | `http://localhost:808x/readyz` | Application ports, reachable from the host |
 
----
+## How Metrics Are Collected
 
-## Table of Contents
-1. [Architecture Overview](#architecture-overview)
-2. [Metrics](#metrics)
-3. [Logging](#logging)
-4. [Distributed Tracing](#distributed-tracing)
-5. [Dashboards](#dashboards)
-6. [Implementation](#implementation)
-7. [Security](#security)
-8. [Operations](#operations)
+Each Spring Boot service exposes Micrometer metrics at `/actuator/prometheus`. In the `docker`
+profile actuator runs on a separate management port (gateway 9080, workflow 9081, scheduler 9082,
+worker 9083), which is not published to the host. Prometheus scrapes these ports every 15s
+(`infrastructure/prometheus/prometheus.yml`); worker replicas are discovered through Docker DNS
+(`dns_sd_configs` on `worker-service`), so scaling workers needs no configuration change.
 
----
+To look at raw metrics of one service:
 
-## Architecture Overview
-
-### Components
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Chronos Services                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
-│  │Workflow  │  │Scheduler │  │ Worker   │  │  API     │         │
-│  │ Service  │  │ Service  │  │ Service  │  │ Gateway  │         │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘         │
-│       │             │             │             │               │
-│       ├─────────────┴─────────────┴─────────────┘               │
-│       │ Micrometer + Spring Actuator                            │
-└───────┼─────────────────────────────────────────────────────────┘
-        │
-        │ /actuator/prometheus (HTTP scrape)
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Prometheus                              │
-│  - Metric storage (time-series database)                        │
-│  - Scrapes /actuator/prometheus every 15s                       │
-│  - Retention: 15 days default                                   │
-│  - Alerting rules                                               │
-└───────┬─────────────────────────────────────────────────────────┘
-        │
-        │ PromQL queries
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                          Grafana                                │
-│  - Visualization dashboards                                     │
-│  - Alerting and notifications                                   │
-│  - Pre-built dashboards for workflows, tasks, workers           │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                      Logging Pipeline                           │
-│                                                                 │
-│  Services → Logback → JSON format → stdout → Log aggregator     │
-│             (structured)  (correlation IDs)                     │
-└─────────────────────────────────────────────────────────────────┘
+```bash
+docker compose exec workflow-service wget -qO- localhost:9081/actuator/prometheus | grep chronos_
 ```
 
-### Technology Stack
-- **Metrics**: Micrometer + Prometheus
-- **Logging**: Logback + Logstash JSON Encoder
-- **Visualization**: Grafana
-- **Tracing**: Correlation IDs (X-Correlation-ID)
-- **Exposure**: Spring Boot Actuator
+## Metrics Catalog
 
----
+All Chronos metrics use low-cardinality labels only (no workflow, execution or user IDs), so the
+number of time series stays constant regardless of load.
 
-## Metrics
+### Workflows
 
-### 1. Workflow Metrics
+| Metric | Type | Labels | Emitted by | Meaning |
+|---|---|---|---|---|
+| `chronos_workflow_executions_total` | counter | `status` | scheduler (COMPLETED, FAILED), workflow (CANCELLED) | Executions that reached a final status |
+| `chronos_workflow_duration_seconds` | histogram | | scheduler | Start-to-finish duration of finished executions |
+| `chronos_workflow_active` | gauge | | scheduler | Executions currently PENDING or RUNNING |
+| `chronos_workflow_executions_started_total` | counter | | workflow | Executions started through the API |
+| `chronos_workflows_created_total` / `_deleted_total` | counter | | workflow | Workflow definitions created / deleted |
 
-#### Workflow Executions
-```
-chronos_workflow_executions_total{status, workflow_id}
-  - Type: Counter
-  - Labels: status (RUNNING|COMPLETED|FAILED), workflow_id
-  - Description: Total number of workflow executions
-```
+### Tasks and Workers
 
-#### Workflow Duration
-```
-chronos_workflow_duration_seconds{workflow_id, status}
-  - Type: Timer/Histogram
-  - Labels: workflow_id, status
-  - Description: Workflow execution duration
-  - Buckets: 1s, 5s, 10s, 30s, 1m, 5m, 10m, 30m, 1h
-```
+| Metric | Type | Labels | Emitted by | Meaning |
+|---|---|---|---|---|
+| `chronos_tasks_total` | counter | `outcome` = completed, failed, retried, requeued | scheduler | Task attempt outcomes (`retried`: failed with attempts left; `requeued`: worker lost) |
+| `chronos_tasks_dispatched_total` | counter | | scheduler | Task attempts dispatched to workers |
+| `chronos_task_execution_seconds` | histogram | `task_type`, `outcome` = success, failure | worker | Execution time of each attempt on a worker |
+| `chronos_worker_tasks_inflight` | gauge | | worker | Tasks currently executing on the worker |
+| `chronos_task_dlq_total` | counter | | worker | Tasks dead-lettered after their final attempt |
 
-#### Active Workflows
-```
-chronos_workflow_active{workflow_id}
-  - Type: Gauge
-  - Labels: workflow_id
-  - Description: Number of currently executing workflows
-```
+### Scheduler
 
-#### Workflow Failures
-```
-chronos_workflow_failures_total{workflow_id, error_type}
-  - Type: Counter
-  - Labels: workflow_id, error_type
-  - Description: Total workflow failures by type
-```
+| Metric | Type | Meaning |
+|---|---|---|
+| `chronos_scheduler_leader` | gauge | 1 on the instance holding leadership, else 0 |
+| `chronos_outbox_pending` | gauge | Outbox messages not yet published to Kafka |
 
-### 2. Task Metrics
+Gauges that need a database query are refreshed every 15s in the background
+(`chronos.metrics.gauge-refresh-interval`), so a scrape never hits MongoDB.
 
-#### Task Executions
-```
-chronos_task_executions_total{task_type, status}
-  - Type: Counter
-  - Labels: task_type, status (STARTED|COMPLETED|FAILED)
-  - Description: Total task executions
-```
+### Standard Metrics
 
-#### Task Duration
-```
-chronos_task_duration_seconds{task_type, worker_id}
-  - Type: Timer/Histogram
-  - Labels: task_type, worker_id
-  - Description: Task execution duration
-  - Buckets: 100ms, 500ms, 1s, 5s, 10s, 30s, 1m, 5m
-```
+Spring Boot and Micrometer also export, among others:
+- `http_server_requests_seconds` (request rate and latency per endpoint)
+- `jvm_memory_used_bytes`, `jvm_gc_pause_seconds`, `process_cpu_usage`
+- `kafka_consumer_fetch_manager_records_lag_max` and other Kafka client metrics (scheduler and worker
+  consumers register a Micrometer listener)
+- `resilience4j_circuitbreaker_state` for the MongoDB circuit breakers
+- `mongodb_driver_pool_*` connection pool metrics
 
-#### Task Retries
-```
-chronos_task_retries_total{task_type, retry_reason}
-  - Type: Counter
-  - Labels: task_type, retry_reason
-  - Description: Total task retry attempts
+## Grafana Dashboard
+
+`infrastructure/grafana/dashboards/chronos-overview.json` is provisioned automatically
+(`infrastructure/grafana/provisioning/`), together with the Prometheus datasource (uid `prometheus`).
+
+| Row | Panels |
+|---|---|
+| Health | Services up, workers up, scheduler leader, active executions, tasks in flight, outbox backlog |
+| Workflows | Executions finished/min by status, success rate, duration p50/p95/p99, API activity |
+| Tasks | Outcomes/min and dispatch rate, execution time p95 by task type, attempts on workers, dead-lettered tasks |
+| Kafka & services | Consumer lag, HTTP requests/s, HTTP p95 latency, JVM heap |
+
+Useful queries:
+
+```promql
+# Workflow success rate over 5 minutes
+100 * sum(rate(chronos_workflow_executions_total{status="COMPLETED"}[5m]))
+    / sum(rate(chronos_workflow_executions_total{status=~"COMPLETED|FAILED"}[5m]))
+
+# p95 workflow duration
+histogram_quantile(0.95, sum by (le) (rate(chronos_workflow_duration_seconds_bucket[5m])))
+
+# Retries per minute
+sum(rate(chronos_tasks_total{outcome="retried"}[5m])) * 60
 ```
 
-#### Task Queue Depth
-```
-chronos_task_queue_depth{task_type}
-  - Type: Gauge
-  - Labels: task_type
-  - Description: Number of tasks waiting in queue
-```
+## Alerts
 
-#### Task Latency
-```
-chronos_task_latency_seconds{task_type}
-  - Type: Histogram
-  - Labels: task_type
-  - Description: Time from task creation to execution start
-```
+Rules live in `infrastructure/prometheus/alerts.yml` and are loaded through `rule_files` in
+`prometheus.yml`. Firing alerts are listed at http://localhost:9090/alerts (no Alertmanager is
+deployed, so nothing is sent anywhere).
 
-### 3. Worker Metrics
-
-#### Available Workers
-```
-chronos_worker_available{worker_id, task_type}
-  - Type: Gauge
-  - Labels: worker_id, task_type
-  - Description: Number of available workers per type
-```
-
-#### Worker Heartbeats
-```
-chronos_worker_heartbeat_timestamp{worker_id}
-  - Type: Gauge
-  - Labels: worker_id
-  - Description: Last heartbeat timestamp (Unix epoch)
-```
-
-#### Worker Task Processing
-```
-chronos_worker_tasks_processed_total{worker_id, task_type, status}
-  - Type: Counter
-  - Labels: worker_id, task_type, status
-  - Description: Tasks processed by worker
-```
-
-#### Worker Failures
-```
-chronos_worker_failures_total{worker_id, failure_type}
-  - Type: Counter
-  - Labels: worker_id, failure_type
-  - Description: Worker failure count
-```
-
-#### Worker Utilization
-```
-chronos_worker_utilization_ratio{worker_id}
-  - Type: Gauge (0.0 to 1.0)
-  - Labels: worker_id
-  - Description: Worker utilization percentage
-```
-
-### 4. Kafka Metrics
-
-#### Consumer Lag
-```
-kafka_consumer_lag{topic, partition, consumer_group}
-  - Type: Gauge
-  - Description: Number of messages behind
-  - Source: Kafka metrics (built-in)
-```
-
-#### Message Processing Rate
-```
-chronos_kafka_messages_processed_total{topic, consumer_group}
-  - Type: Counter
-  - Labels: topic, consumer_group
-  - Description: Total messages processed
-```
-
-#### Message Processing Duration
-```
-chronos_kafka_message_processing_seconds{topic}
-  - Type: Histogram
-  - Labels: topic
-  - Description: Time to process a message
-```
-
-#### Kafka Errors
-```
-chronos_kafka_errors_total{topic, error_type}
-  - Type: Counter
-  - Labels: topic, error_type
-  - Description: Kafka processing errors
-```
-
-### 5. Scheduler Metrics
-
-#### Leader Election
-```
-chronos_scheduler_leader{instance_id}
-  - Type: Gauge (0 or 1)
-  - Labels: instance_id
-  - Description: Whether this instance is leader
-```
-
-#### Scheduling Lag
-```
-chronos_scheduler_lag_seconds
-  - Type: Histogram
-  - Description: Difference between scheduled time and actual execution
-```
-
-#### Scheduled Workflows
-```
-chronos_scheduler_workflows_scheduled_total
-  - Type: Counter
-  - Description: Total workflows scheduled
-```
-
-### 6. Database Metrics
-
-#### MongoDB Operations
-```
-mongodb_driver_commands_seconds{command, status}
-  - Type: Timer
-  - Labels: command, status
-  - Description: MongoDB command duration
-  - Source: Spring Data MongoDB metrics
-```
-
-#### Connection Pool
-```
-mongodb_driver_pool_size{pool}
-  - Type: Gauge
-  - Description: MongoDB connection pool size
-```
-
-### 7. JVM Metrics (Built-in)
-
-```
-jvm_memory_used_bytes{area}
-jvm_gc_pause_seconds{action, cause}
-jvm_threads_live
-process_cpu_usage
-process_uptime_seconds
-```
-
----
+| Alert | Condition | Severity |
+|---|---|---|
+| ServiceDown | a service target is down for 1m | critical |
+| NoWorkersAvailable | no worker target up for 1m | critical |
+| NoSchedulerLeader | no scheduler holds leadership for 2m | critical |
+| HighWorkflowFailureRate | more than 20% of executions failed over 10m | warning |
+| TasksDeadLettered | any task dead-lettered in the last 15m | warning |
+| OutboxBacklog | more than 100 unpublished outbox messages for 5m | warning |
+| KafkaConsumerLag | consumer lag above 1000 records for 5m | warning |
 
 ## Logging
 
-### Structured Logging Format
-
-All logs are JSON-formatted with consistent structure:
-
-```json
-{
-  "timestamp": "2026-09-16T23:30:45.123Z",
-  "level": "INFO",
-  "thread": "http-nio-8081-exec-1",
-  "logger": "com.chronos.workflow.service.WorkflowService",
-  "message": "Workflow execution started",
-  "correlation_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-  "service": "workflow-service",
-  "workflow_id": "wf-123",
-  "execution_id": "exec-456",
-  "user_id": "user-789",
-  "context": {
-    "workflow_name": "data-pipeline",
-    "task_count": 5
-  }
-}
-```
-
-### Log Levels
-
-- **ERROR**: Failures requiring immediate attention
-- **WARN**: Potentially harmful situations (retries, degraded performance)
-- **INFO**: Important business events (workflow started/completed, task executed)
-- **DEBUG**: Detailed diagnostic information (disabled in production)
-- **TRACE**: Very detailed diagnostic information (never in production)
-
-### Correlation IDs
-
-#### Generation
-- Generated at API Gateway for external requests
-- Propagated through HTTP headers: `X-Correlation-ID`
-- Propagated through Kafka message headers
-- Stored in MDC (Mapped Diagnostic Context)
-
-#### Usage
-```java
-// Automatic in logs via MDC
-log.info("Processing workflow"); // Includes correlation_id
-
-// Manual access
-String correlationId = MDC.get("correlation_id");
-```
-
-### Sensitive Data Filtering
-
-**Never log**:
-- Passwords (plaintext or hashed)
-- JWT tokens (full token)
-- API keys
-- Personal identifiable information (PII) unless necessary
-- Full task configurations (may contain secrets)
-
-**Safe to log**:
-- User IDs (not emails)
-- Workflow IDs, task IDs, execution IDs
-- Status and state transitions
-- Timing and duration
-- Error types (not full stack traces with data)
-
-### Log Aggregation
-
-Recommended tools:
-1. **ELK Stack** (Elasticsearch, Logstash, Kibana)
-2. **Loki** + Grafana
-3. **CloudWatch Logs** (AWS)
-4. **Stackdriver** (GCP)
-
-Configuration:
-- JSON logs to stdout
-- Container runtime captures stdout
-- Log aggregator ingests from containers
-- Query via Kibana/Grafana
-
----
-
-## Distributed Tracing
-
-### Correlation ID Flow
-
-```
-┌──────────┐   X-Correlation-ID     ┌──────────┐
-│  Client  │ ─────────────────────> │   API    │
-└──────────┘                        │ Gateway  │
-                                    └────┬─────┘
-                                         │ Generate if missing
-                                         │
-                                    ┌────▼─────┐
-                                    │ Workflow │
-                                    │ Service  │
-                                    └────┬─────┘
-                                         │ Propagate via HTTP
-                                         │
-                  ┌──────────────────────┼──────────────────────┐
-                  │                      │                      │
-            ┌─────▼─────┐          ┌─────▼─────┐        ┌─────▼─────┐
-            │ Scheduler │          │  Worker   │        │  Worker   │
-            │  Service  │          │ Service 1 │        │ Service 2 │
-            └───────────┘          └───────────┘        └───────────┘
-                  │                      │                      │
-                  └──────────────────────┴──────────────────────┘
-                                         │
-                                         ▼
-                               Kafka (via headers)
-```
-
-### Implementation
-
-#### 1. Generate at API Gateway
-```java
-@Component
-public class CorrelationIdFilter implements Filter {
-    @Override
-    public void doFilter(ServletRequest request, ServletResponse response, 
-                        FilterChain chain) {
-        HttpServletRequest httpRequest = (HttpServletRequest) request;
-        String correlationId = httpRequest.getHeader("X-Correlation-ID");
-        
-        if (correlationId == null) {
-            correlationId = UUID.randomUUID().toString();
-        }
-        
-        MDC.put("correlation_id", correlationId);
-        chain.doFilter(request, response);
-        MDC.clear();
-    }
-}
-```
-
-#### 2. Propagate via HTTP
-```java
-@Component
-public class CorrelationIdInterceptor implements ClientHttpRequestInterceptor {
-    @Override
-    public ClientHttpResponse intercept(HttpRequest request, byte[] body, 
-                                       ClientHttpRequestExecution execution) {
-        String correlationId = MDC.get("correlation_id");
-        if (correlationId != null) {
-            request.getHeaders().set("X-Correlation-ID", correlationId);
-        }
-        return execution.execute(request, body);
-    }
-}
-```
-
-#### 3. Propagate via Kafka
-```java
-public void sendMessage(String topic, Object payload) {
-    ProducerRecord<String, Object> record = new ProducerRecord<>(topic, payload);
-    
-    String correlationId = MDC.get("correlation_id");
-    if (correlationId != null) {
-        record.headers().add("X-Correlation-ID", 
-            correlationId.getBytes(StandardCharsets.UTF_8));
-    }
-    
-    kafkaTemplate.send(record);
-}
-```
-
-#### 4. Extract from Kafka
-```java
-@KafkaListener
-public void handleMessage(ConsumerRecord<String, Object> record) {
-    Header correlationHeader = record.headers()
-        .lastHeader("X-Correlation-ID");
-    
-    if (correlationHeader != null) {
-        String correlationId = new String(correlationHeader.value(), 
-            StandardCharsets.UTF_8);
-        MDC.put("correlation_id", correlationId);
-    }
-    
-    try {
-        // Process message
-    } finally {
-        MDC.clear();
-    }
-}
-```
-
----
-
-## Dashboards
-
-### 1. Workflow Execution Dashboard
-
-**Purpose**: Monitor workflow health and performance
-
-**Panels**:
-1. **Workflow Execution Rate** (Graph)
-   - Query: `rate(chronos_workflow_executions_total[5m])`
-   - Split by status
-
-2. **Active Workflows** (Gauge)
-   - Query: `sum(chronos_workflow_active)`
-
-3. **Workflow Success Rate** (Graph)
-   - Query: `rate(chronos_workflow_executions_total{status="COMPLETED"}[5m]) / rate(chronos_workflow_executions_total[5m])`
-
-4. **Workflow Duration p50/p95/p99** (Graph)
-   - Query: `histogram_quantile(0.95, chronos_workflow_duration_seconds)`
-
-5. **Top Failed Workflows** (Table)
-   - Query: `topk(10, sum by (workflow_id) (chronos_workflow_failures_total))`
-
-6. **Workflow Execution Timeline** (Heatmap)
-   - Query: `chronos_workflow_duration_seconds`
-
-### 2. Task Success/Failure Dashboard
-
-**Purpose**: Monitor task execution health
-
-**Panels**:
-1. **Task Execution Rate by Type** (Graph)
-   - Query: `rate(chronos_task_executions_total[5m])`
-   - Split by task_type
-
-2. **Task Success Rate** (Gauge)
-   - Query: `rate(chronos_task_executions_total{status="COMPLETED"}[5m]) / rate(chronos_task_executions_total[5m])`
-
-3. **Task Failure Rate** (Graph)
-   - Query: `rate(chronos_task_executions_total{status="FAILED"}[5m])`
-
-4. **Task Retry Rate** (Graph)
-   - Query: `rate(chronos_task_retries_total[5m])`
-
-5. **Top Failing Tasks** (Table)
-   - Query: `topk(10, sum by (task_type) (chronos_task_executions_total{status="FAILED"}))`
-
-6. **Task Queue Depth** (Graph)
-   - Query: `chronos_task_queue_depth`
-
-### 3. Worker Availability Dashboard
-
-**Purpose**: Monitor worker health and capacity
-
-**Panels**:
-1. **Total Available Workers** (Stat)
-   - Query: `sum(chronos_worker_available)`
-
-2. **Workers by Type** (Pie Chart)
-   - Query: `sum by (task_type) (chronos_worker_available)`
-
-3. **Worker Heartbeat Status** (Table)
-   - Query: `time() - chronos_worker_heartbeat_timestamp > 60`
-   - Shows stale workers (no heartbeat >60s)
-
-4. **Worker Utilization** (Gauge)
-   - Query: `avg(chronos_worker_utilization_ratio)`
-
-5. **Worker Failure Rate** (Graph)
-   - Query: `rate(chronos_worker_failures_total[5m])`
-
-6. **Tasks Processed per Worker** (Bar Chart)
-   - Query: `sum by (worker_id) (chronos_worker_tasks_processed_total)`
-
-### 4. Task Latency Dashboard
-
-**Purpose**: Monitor task performance and bottlenecks
-
-**Panels**:
-1. **Task Latency p50/p95/p99** (Graph)
-   - Query: `histogram_quantile(0.95, rate(chronos_task_duration_seconds_bucket[5m]))`
-
-2. **Task Latency Heatmap** (Heatmap)
-   - Query: `chronos_task_duration_seconds`
-
-3. **Queue Wait Time** (Graph)
-   - Query: `chronos_task_latency_seconds`
-
-4. **Slowest Tasks** (Table)
-   - Query: `topk(10, histogram_quantile(0.99, chronos_task_duration_seconds))`
-
-5. **Task Duration by Type** (Bar Chart)
-   - Query: `avg by (task_type) (chronos_task_duration_seconds)`
-
-### 5. Kafka Activity Dashboard
-
-**Purpose**: Monitor message processing and lag
-
-**Panels**:
-1. **Consumer Lag** (Graph)
-   - Query: `kafka_consumer_lag`
-   - Split by topic
-
-2. **Message Processing Rate** (Graph)
-   - Query: `rate(chronos_kafka_messages_processed_total[5m])`
-
-3. **Message Processing Duration** (Graph)
-   - Query: `histogram_quantile(0.95, chronos_kafka_message_processing_seconds)`
-
-4. **Kafka Errors** (Graph)
-   - Query: `rate(chronos_kafka_errors_total[5m])`
-
-5. **Consumer Group Lag Table** (Table)
-   - Query: `max by (topic, partition) (kafka_consumer_lag)`
-
-### 6. Retry Counts Dashboard
-
-**Purpose**: Monitor retry patterns and failure recovery
-
-**Panels**:
-1. **Total Retries** (Stat)
-   - Query: `sum(chronos_task_retries_total)`
-
-2. **Retry Rate by Type** (Graph)
-   - Query: `rate(chronos_task_retries_total[5m])`
-   - Split by task_type
-
-3. **Retries by Reason** (Pie Chart)
-   - Query: `sum by (retry_reason) (chronos_task_retries_total)`
-
-4. **Retry Success Rate** (Gauge)
-   - Query: `(chronos_task_executions_total{status="COMPLETED"} after retry) / chronos_task_retries_total`
-
-5. **Tasks with Most Retries** (Table)
-   - Query: `topk(10, chronos_task_retries_total)`
-
----
-
-## Implementation
-
-### 1. Dependencies (pom.xml)
-
-```xml
-<!-- Actuator -->
-<dependency>
-    <groupId>org.springframework.boot</groupId>
-    <artifactId>spring-boot-starter-actuator</artifactId>
-</dependency>
-
-<!-- Micrometer Prometheus -->
-<dependency>
-    <groupId>io.micrometer</groupId>
-    <artifactId>micrometer-registry-prometheus</artifactId>
-</dependency>
-
-<!-- Structured Logging -->
-<dependency>
-    <groupId>net.logstash.logback</groupId>
-    <artifactId>logstash-logback-encoder</artifactId>
-    <version>7.4</version>
-</dependency>
-```
-
-### 2. Application Configuration
-
-```yaml
-# application.yml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,prometheus
-      base-path: /actuator
-  endpoint:
-    health:
-      show-details: always
-    prometheus:
-      enabled: true
-  metrics:
-    export:
-      prometheus:
-        enabled: true
-    tags:
-      application: ${spring.application.name}
-      environment: ${ENVIRONMENT:dev}
-    distribution:
-      percentiles-histogram:
-        http.server.requests: true
-        chronos.workflow.duration: true
-        chronos.task.duration: true
-
-logging:
-  level:
-    root: INFO
-    com.chronos: DEBUG
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} [%X{correlation_id}] [%thread] %-5level %logger{36} - %msg%n"
-```
-
-### 3. Logback Configuration (logback-spring.xml)
-
-```xml
-<configuration>
-    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
-    
-    <appender name="CONSOLE_JSON" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
-            <includeMdcKeyName>correlation_id</includeMdcKeyName>
-            <includeMdcKeyName>workflow_id</includeMdcKeyName>
-            <includeMdcKeyName>execution_id</includeMdcKeyName>
-            <includeMdcKeyName>task_id</includeMdcKeyName>
-            <includeMdcKeyName>user_id</includeMdcKeyName>
-            <customFields>{"service":"${spring.application.name}"}</customFields>
-            <fieldNames>
-                <timestamp>timestamp</timestamp>
-                <message>message</message>
-                <logger>logger</logger>
-                <level>level</level>
-                <thread>thread</thread>
-            </fieldNames>
-        </encoder>
-    </appender>
-    
-    <root level="INFO">
-        <appender-ref ref="CONSOLE_JSON"/>
-    </root>
-</configuration>
-```
-
-### 4. Metrics Configuration Class
-
-```java
-@Configuration
-public class MetricsConfiguration {
-    
-    @Bean
-    public MeterRegistryCustomizer<MeterRegistry> metricsCommonTags(
-            @Value("${spring.application.name}") String applicationName) {
-        return registry -> registry.config()
-            .commonTags("application", applicationName);
-    }
-}
-```
-
-### 5. Custom Metrics
-
-```java
-@Component
-public class WorkflowMetrics {
-    
-    private final Counter workflowExecutions;
-    private final Timer workflowDuration;
-    private final Gauge activeWorkflows;
-    
-    public WorkflowMetrics(MeterRegistry registry) {
-        this.workflowExecutions = Counter.builder("chronos.workflow.executions")
-            .description("Total workflow executions")
-            .tags("status", "")
-            .register(registry);
-            
-        this.workflowDuration = Timer.builder("chronos.workflow.duration")
-            .description("Workflow execution duration")
-            .publishPercentiles(0.5, 0.95, 0.99)
-            .register(registry);
-            
-        this.activeWorkflows = Gauge.builder("chronos.workflow.active", 
-            () -> getActiveWorkflowCount())
-            .description("Active workflows")
-            .register(registry);
-    }
-}
-```
-
----
-
-## Security
-
-### Actuator Security
-
-**Production Configuration**:
-```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,prometheus
-  endpoint:
-    health:
-      show-details: when-authorized
-```
-
-**Secure Endpoints**:
-- `/actuator/health` - Public (for load balancers)
-- `/actuator/prometheus` - Internal network only (Prometheus scrape)
-- All other actuator endpoints - Disabled in production
-
-### Metric Data Security
-
-**Do NOT expose in metrics**:
-- User credentials
-- API keys
-- Sensitive task data
-- Personal information
-
-**Safe metric labels**:
-- IDs (workflow_id, task_id, worker_id)
-- Types (task_type, error_type)
-- Status (COMPLETED, FAILED)
-- Service names
-
-### Log Security
-
-**Filtering sensitive data**:
-```java
-@Component
-public class SensitiveDataFilter implements Filter {
-    private static final Pattern PASSWORD_PATTERN = 
-        Pattern.compile("password\\s*=\\s*\"[^\"]*\"");
-    
-    public String filter(String message) {
-        return PASSWORD_PATTERN.matcher(message)
-            .replaceAll("password=\"***\"");
-    }
-}
-```
-
----
-
-## Operations
-
-### Prometheus Setup
-
-**prometheus.yml**:
-```yaml
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-
-scrape_configs:
-  - job_name: 'chronos-services'
-    metrics_path: '/actuator/prometheus'
-    static_configs:
-      - targets:
-          - 'workflow-service:8081'
-          - 'scheduler-service:8082'
-          - 'worker-service:8083'
-          - 'api-gateway:8080'
-```
-
-### Grafana Setup
-
-**Data Source**:
-- Type: Prometheus
-- URL: http://prometheus:9090
-- Access: Server (default)
-
-**Dashboard Import**:
-1. Copy JSON from `grafana-dashboards/` directory
-2. Grafana UI → Dashboards → Import
-3. Paste JSON or upload file
-4. Select Prometheus data source
-
-### Alerting Rules
-
-**prometheus-alerts.yml**:
-```yaml
-groups:
-  - name: chronos_alerts
-    interval: 30s
-    rules:
-      - alert: HighWorkflowFailureRate
-        expr: rate(chronos_workflow_failures_total[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High workflow failure rate"
-          
-      - alert: WorkerDown
-        expr: time() - chronos_worker_heartbeat_timestamp > 120
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Worker {{ $labels.worker_id }} is down"
-          
-      - alert: HighKafkaLag
-        expr: kafka_consumer_lag > 1000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High Kafka lag on {{ $labels.topic }}"
-```
-
-### Troubleshooting
-
-**Common Issues**:
-
-1. **No metrics appearing**
-   - Check `/actuator/prometheus` is accessible
-   - Verify Prometheus scrape config
-   - Check firewall rules
-
-2. **High cardinality warnings**
-   - Avoid unbounded label values
-   - Use finite set of labels
-   - Aggregate at query time
-
-3. **Missing correlation IDs**
-   - Verify MDC.put() in all entry points
-   - Check filter/interceptor order
-   - Confirm Kafka header propagation
-
-4. **Logs not structured**
-   - Verify logback-spring.xml
-   - Check Logstash encoder dependency
-   - Validate JSON format
-
----
-
-## Summary
-
-**Complete observability stack**:
-- Prometheus metrics for all services
-- Structured JSON logging with correlation IDs
-- Grafana dashboards for visualization
-- Alerting rules for critical issues
-- Secure sensitive data filtering
-- Production-ready configuration
-
-**Key metrics tracked**:
-- Workflow: executions, failures, duration, active count
-- Tasks: started, completed, failed, retries, latency, queue depth
-- Workers: availability, heartbeats, utilization, failures
-- Kafka: consumer lag, processing rate, errors
-- Scheduler: leader election, scheduling lag
-
-**Dashboards provided**:
-1. Workflow Execution Overview
-2. Task Success/Failure Analysis
-3. Worker Health Monitoring
-4. Task Latency Performance
-5. Kafka Activity Tracking
-6. Retry Pattern Analysis
-
-Ready for production deployment with full observability!
+- **Workflow service**: JSON logs (logstash encoder) in the `docker` profile, including the
+  `correlation_id` MDC field; plain text with the correlation ID in the `dev`/`local` profiles.
+- **Other services**: plain-text console logs.
+- **Correlation IDs**: the gateway accepts an incoming `X-Correlation-ID` or generates one, returns it
+  in the response and forwards it to the workflow service, which logs it with every request.
+  Kafka events carry the execution ID as `correlationId`.
+- Containers use Docker's `json-file` log driver (10 MB x 3 files). View logs with
+  `docker compose logs -f <service>` or `./scripts/logs.sh`.
+
+## Not Implemented
+
+- Distributed tracing (no OpenTelemetry/Jaeger backend)
+- Centralised log aggregation (e.g. Loki or ELK)
+- Alert delivery (Alertmanager)

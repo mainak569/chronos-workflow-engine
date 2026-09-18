@@ -1,0 +1,845 @@
+{
+  "info": {
+    "_postman_id": "00000000-0000-0000-0063-68726f6e6f73",
+    "name": "Chronos API",
+    "description": "Chronos workflow orchestration API. Run the whole collection in order (Collection Runner or `npx newman run`): it registers a user, creates and executes a workflow, waits for completion, and cleans up. Requests go through the API gateway (`baseUrl`).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Generate a unique user once per run",
+          "if (!pm.collectionVariables.get('email')) {",
+          "  const id = Date.now();",
+          "  pm.collectionVariables.set('email', `postman${id}@example.com`);",
+          "  pm.collectionVariables.set('username', `postman${id}`);",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080/api/v1"
+    },
+    {
+      "key": "password",
+      "value": "SecurePass123!"
+    },
+    {
+      "key": "email",
+      "value": ""
+    },
+    {
+      "key": "username",
+      "value": ""
+    },
+    {
+      "key": "token",
+      "value": ""
+    },
+    {
+      "key": "workflowId",
+      "value": ""
+    },
+    {
+      "key": "scheduledWorkflowId",
+      "value": ""
+    },
+    {
+      "key": "executionId",
+      "value": ""
+    },
+    {
+      "key": "cancelExecutionId",
+      "value": ""
+    },
+    {
+      "key": "polls",
+      "value": "0"
+    }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Register",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            },
+            "description": "Creates a user and returns a JWT. The pre-request script of the collection generates a unique email.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"username\": \"{{username}}\",\n  \"password\": \"{{password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Unique user per run",
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('token', body.token);",
+                  "pm.test('returns a token', () => pm.expect(body.token).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set('token', pm.response.json().token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login with wrong password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"wrong-password\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test('error code', () => pm.expect(pm.response.json().error).to.eql('AUTHENTICATION_FAILED'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Workflows",
+      "item": [
+        {
+          "name": "Create workflow",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Image Processing Pipeline\",\n  \"description\": \"Resize, compress and upload an image\",\n  \"tasks\": [\n    {\n      \"taskId\": \"resize\",\n      \"name\": \"Resize image\",\n      \"taskType\": \"IMAGE_RESIZE\",\n      \"configuration\": {\n        \"width\": 1280,\n        \"height\": 720\n      }\n    },\n    {\n      \"taskId\": \"compress\",\n      \"name\": \"Compress image\",\n      \"taskType\": \"IMAGE_COMPRESS\",\n      \"dependencies\": [\n        \"resize\"\n      ],\n      \"configuration\": {\n        \"quality\": 85\n      },\n      \"retryConfig\": {\n        \"maxAttempts\": 3,\n        \"initialDelayMs\": 2000,\n        \"backoffMultiplier\": 2.0,\n        \"maxDelayMs\": 60000\n      },\n      \"timeoutMs\": 60000\n    },\n    {\n      \"taskId\": \"validate\",\n      \"name\": \"Validate output\",\n      \"taskType\": \"DATA_VALIDATION\",\n      \"dependencies\": [\n        \"compress\"\n      ]\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('workflowId', pm.response.json().workflowId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create scheduled workflow (cron)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows"
+              ]
+            },
+            "description": "Runs every day at 02:00 (Spring cron: second minute hour day month weekday).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Nightly report\",\n  \"schedule\": \"0 0 2 * * *\",\n  \"timezone\": \"UTC\",\n  \"tasks\": [\n    {\n      \"taskId\": \"report\",\n      \"name\": \"Build report\",\n      \"taskType\": \"DATA_PROCESSING\"\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('scheduledWorkflowId', pm.response.json().workflowId);",
+                  "pm.test('schedule stored', () => pm.expect(pm.response.json().schedule).to.eql('0 0 2 * * *'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create workflow with a cycle (rejected)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Broken\",\n  \"tasks\": [\n    {\n      \"taskId\": \"a\",\n      \"name\": \"A\",\n      \"taskType\": \"DATA_PROCESSING\",\n      \"dependencies\": [\n        \"b\"\n      ]\n    },\n    {\n      \"taskId\": \"b\",\n      \"name\": \"B\",\n      \"taskType\": \"DATA_PROCESSING\",\n      \"dependencies\": [\n        \"a\"\n      ]\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test('error code', () => pm.expect(pm.response.json().error).to.eql('WORKFLOW_VALIDATION_ERROR'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List workflows",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test('contains created workflow', () => pm.expect(pm.response.json().map(w => w.workflowId)).to.include(pm.collectionVariables.get('workflowId')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get workflow",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{workflowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{workflowId}}"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get workflow without token (401)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{workflowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{workflowId}}"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Executions",
+      "item": [
+        {
+          "name": "Start execution",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{workflowId}}/execute",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{workflowId}}",
+                "execute"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"input\": {\n    \"imageUrl\": \"s3://bucket/photo.jpg\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('executionId', pm.response.json().executionId);",
+                  "pm.test('starts PENDING', () => pm.expect(pm.response.json().status).to.eql('PENDING'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get execution (waits for completion)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{executionId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{executionId}}"
+              ]
+            },
+            "description": "When run in the Collection Runner or Newman this request re-runs itself until the execution finishes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "// Poll until the execution finishes (tasks are simulated and take ~1s each)",
+                  "const body = pm.response.json();",
+                  "const polls = Number(pm.collectionVariables.get('polls') || 0);",
+                  "if (!['COMPLETED', 'FAILED', 'CANCELLED'].includes(body.status) && polls < 30) {",
+                  "  pm.collectionVariables.set('polls', polls + 1);",
+                  "  setTimeout(() => {}, 1000);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('polls', 0);",
+                  "  pm.test('execution completed', () => pm.expect(body.status).to.eql('COMPLETED'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get task executions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{executionId}}/tasks",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{executionId}}",
+                "tasks"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test('all tasks completed', () => pm.response.json().forEach(t => pm.expect(t.status).to.eql('COMPLETED')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get single task",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{executionId}}/tasks/resize",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{executionId}}",
+                "tasks",
+                "resize"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Execution statistics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{executionId}}/statistics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{executionId}}",
+                "statistics"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test('100% complete', () => pm.expect(pm.response.json().completionPercentage).to.eql(100));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel finished execution (409)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{executionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{executionId}}",
+                "cancel"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Start another execution",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{workflowId}}/execute",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{workflowId}}",
+                "execute"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set('cancelExecutionId', pm.response.json().executionId);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel running execution",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/executions/{{cancelExecutionId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "executions",
+                "{{cancelExecutionId}}",
+                "cancel"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Cleanup",
+      "item": [
+        {
+          "name": "Delete scheduled workflow",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{scheduledWorkflowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{scheduledWorkflowId}}"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delete workflow",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/workflows/{{workflowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "workflows",
+                "{{workflowId}}"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 204\", () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

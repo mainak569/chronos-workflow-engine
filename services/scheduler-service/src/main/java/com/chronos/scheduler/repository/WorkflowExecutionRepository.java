@@ -20,5 +20,7 @@ public interface WorkflowExecutionRepository extends MongoRepository<WorkflowExe
     
     List<WorkflowExecution> findByStatusIn(List<ExecutionStatus> statuses);
     
+    long countByStatusIn(List<ExecutionStatus> statuses);
+    
     Optional<WorkflowExecution> findById(String id);
 }

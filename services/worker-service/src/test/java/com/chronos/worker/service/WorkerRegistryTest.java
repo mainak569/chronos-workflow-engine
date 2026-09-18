@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -47,8 +48,8 @@ class WorkerRegistryTest {
         objectMapper.findAndRegisterModules(); // Register JavaTimeModule
         workerRegistry = new WorkerRegistry(redisTemplate, objectMapper);
         
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(redisTemplate.opsForSet()).thenReturn(setOperations);
+        lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        lenient().when(redisTemplate.opsForSet()).thenReturn(setOperations);
     }
     
     @Test
@@ -124,13 +125,11 @@ class WorkerRegistryTest {
                 eq(TimeUnit.SECONDS)
         );
         
-        // Verify metadata updated
+        // Verify metadata updated with the new lastHeartbeat
         ArgumentCaptor<String> valueCaptor = ArgumentCaptor.forClass(String.class);
-        verify(valueOperations, atLeast(2)).set(anyString(), valueCaptor.capture());
+        verify(valueOperations).set(eq("worker:metadata:worker-1"), valueCaptor.capture());
         
-        // Last call should have updated lastHeartbeat
-        String lastMetadata = valueCaptor.getAllValues().get(valueCaptor.getAllValues().size() - 1);
-        WorkerMetadata updated = objectMapper.readValue(lastMetadata, WorkerMetadata.class);
+        WorkerMetadata updated = objectMapper.readValue(valueCaptor.getValue(), WorkerMetadata.class);
         assertThat(updated.getLastHeartbeat()).isNotNull();
     }
     
@@ -393,5 +392,39 @@ class WorkerRegistryTest {
                 .supportedTaskTypes(Arrays.asList("IMAGE_RESIZE", "IMAGE_COMPRESS"))
                 .lastHeartbeat(Instant.now())
                 .build();
+    }
+
+    @Test
+    @DisplayName("Should stay BUSY while concurrent tasks are running and become AVAILABLE after the last one")
+    void shouldTrackConcurrentTasks() throws Exception {
+        String workerId = "worker-1";
+        WorkerMetadata worker = createAvailableWorker(workerId);
+        when(valueOperations.get("worker:metadata:worker-1"))
+                .thenReturn(objectMapper.writeValueAsString(worker));
+
+        // Two tasks start concurrently on the same worker
+        workerRegistry.markWorkerBusy(workerId, "exec-1", "task-1");
+        workerRegistry.markWorkerBusy(workerId, "exec-2", "task-2");
+
+        // First task finishes: worker keeps running the second one
+        workerRegistry.markWorkerAvailable(workerId);
+        verify(setOperations, never()).add("worker:index:status:AVAILABLE", workerId);
+
+        // Second task finishes: worker is available again
+        workerRegistry.markWorkerAvailable(workerId);
+        verify(setOperations).add("worker:index:status:AVAILABLE", workerId);
+    }
+
+    @Test
+    @DisplayName("Should mark an already BUSY worker busy again without failing")
+    void shouldAllowRepeatedBusyTransitions() throws Exception {
+        String workerId = "worker-1";
+        WorkerMetadata worker = createAvailableWorker(workerId);
+        worker.markBusy("exec-0", "task-0");
+        when(valueOperations.get("worker:metadata:worker-1"))
+                .thenReturn(objectMapper.writeValueAsString(worker));
+
+        assertThatCode(() -> workerRegistry.markWorkerBusy(workerId, "exec-1", "task-1"))
+                .doesNotThrowAnyException();
     }
 }

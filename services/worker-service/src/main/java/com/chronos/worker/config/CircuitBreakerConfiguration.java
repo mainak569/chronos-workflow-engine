@@ -7,6 +7,8 @@ import io.github.resilience4j.core.registry.EntryAddedEvent;
 import io.github.resilience4j.core.registry.EntryRemovedEvent;
 import io.github.resilience4j.core.registry.EntryReplacedEvent;
 import io.github.resilience4j.core.registry.RegistryEventConsumer;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -26,7 +28,7 @@ public class CircuitBreakerConfiguration {
     private static final Logger log = LoggerFactory.getLogger(CircuitBreakerConfiguration.class);
     
     @Bean
-    public CircuitBreakerRegistry circuitBreakerRegistry() {
+    public CircuitBreakerRegistry circuitBreakerRegistry(MeterRegistry meterRegistry) {
         CircuitBreakerConfig config = CircuitBreakerConfig.custom()
                 .failureRateThreshold(50)
                 .waitDurationInOpenState(Duration.ofSeconds(30))
@@ -46,9 +48,7 @@ public class CircuitBreakerConfiguration {
                 )
                 .build();
         
-        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
-        
-        registry.getEventPublisher().onEntryAdded(new RegistryEventConsumer<CircuitBreaker>() {
+        RegistryEventConsumer<CircuitBreaker> stateChangeLogger = new RegistryEventConsumer<>() {
             @Override
             public void onEntryAddedEvent(EntryAddedEvent<CircuitBreaker> event) {
                 CircuitBreaker cb = event.getAddedEntry();
@@ -69,7 +69,13 @@ public class CircuitBreakerConfiguration {
             @Override
             public void onEntryReplacedEvent(EntryReplacedEvent<CircuitBreaker> entryReplacedEvent) {
             }
-        });
+        };
+
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config, stateChangeLogger);
+
+        // Export state, call and failure-rate metrics (resilience4j_circuitbreaker_*) to Prometheus;
+        // this registry replaces the auto-configured one, so the binding has to be done here
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meterRegistry);
         
         log.info("Circuit breaker registry initialized");
         

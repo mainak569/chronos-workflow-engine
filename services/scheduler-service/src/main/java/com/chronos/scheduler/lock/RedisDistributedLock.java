@@ -38,6 +38,15 @@ public class RedisDistributedLock implements DistributedLock {
             "    return 0 " +
             "end";
     
+    // Lua script for atomic release when the lock value starts with the owner prefix
+    private static final String RELEASE_IF_OWNER_SCRIPT =
+            "local value = redis.call('get', KEYS[1]) " +
+            "if value and string.sub(value, 1, string.len(ARGV[1])) == ARGV[1] then " +
+            "    return redis.call('del', KEYS[1]) " +
+            "else " +
+            "    return 0 " +
+            "end";
+    
     public RedisDistributedLock(RedisTemplate<String, String> redisTemplate) {
         this.redisTemplate = redisTemplate;
     }
@@ -134,6 +143,21 @@ public class RedisDistributedLock implements DistributedLock {
             return Boolean.TRUE.equals(redisTemplate.hasKey(lockKey));
         } catch (Exception e) {
             logger.error("Error checking lock status: key={}", lockKey, e);
+            return false;
+        }
+    }
+
+    @Override
+    public boolean releaseIfOwnedBy(String lockKey, String ownerPrefix) {
+        try {
+            Long result = redisTemplate.execute(
+                    RedisScript.of(RELEASE_IF_OWNER_SCRIPT, Long.class),
+                    Collections.singletonList(lockKey),
+                    ownerPrefix
+            );
+            return result != null && result > 0;
+        } catch (Exception e) {
+            logger.error("Error releasing lock by owner: key={}, owner={}", lockKey, ownerPrefix, e);
             return false;
         }
     }

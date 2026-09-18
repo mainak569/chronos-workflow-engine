@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -35,6 +36,11 @@ public class WorkerRegistry {
     
     // Heartbeat TTL: 30 seconds (workers should heartbeat every 10 seconds)
     private static final long HEARTBEAT_TTL_SECONDS = 30;
+    
+    /**
+     * Tasks currently executing per worker; the worker is BUSY while this is above zero.
+     */
+    private final Map<String, Integer> inFlightTasks = new ConcurrentHashMap<>();
     
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
@@ -102,6 +108,8 @@ public class WorkerRegistry {
      * Mark worker as busy (executing a task).
      */
     public void markWorkerBusy(String workerId, String executionId, String taskId) {
+        int inFlight = inFlightTasks.merge(workerId, 1, Integer::sum);
+        
         WorkerMetadata worker = getWorker(workerId);
         if (worker == null) {
             log.warn("Cannot mark non-existent worker as busy: {}", workerId);
@@ -118,13 +126,21 @@ public class WorkerRegistry {
         // Add to BUSY index
         addToStatusIndex(workerId, WorkerStatus.BUSY);
         
-        log.info("Worker marked as busy: {} (executionId={}, taskId={})", workerId, executionId, taskId);
+        log.debug("Worker marked as busy: {} (executionId={}, taskId={}, inFlight={})",
+                workerId, executionId, taskId, inFlight);
     }
     
     /**
      * Mark worker as available (task completed).
      */
     public void markWorkerAvailable(String workerId) {
+        // Stay BUSY while other tasks are still running on this worker
+        int inFlight = inFlightTasks.merge(workerId, -1, (current, delta) -> Math.max(0, current + delta));
+        if (inFlight > 0) {
+            log.debug("Worker {} still running {} task(s), staying BUSY", workerId, inFlight);
+            return;
+        }
+        
         WorkerMetadata worker = getWorker(workerId);
         if (worker == null) {
             log.warn("Cannot mark non-existent worker as available: {}", workerId);
@@ -141,7 +157,7 @@ public class WorkerRegistry {
         // Add to AVAILABLE index
         addToStatusIndex(workerId, WorkerStatus.AVAILABLE);
         
-        log.info("Worker marked as available: {}", workerId);
+        log.debug("Worker marked as available: {}", workerId);
     }
     
     /**

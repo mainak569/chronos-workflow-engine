@@ -11,6 +11,7 @@ import java.util.Map;
 /**
  * REST controller for lock management and monitoring.
  * Provides endpoints for viewing lock statistics and manually triggering cleanup.
+ * Requires the X-Admin-Token header (see AdminApiSecurityConfig).
  */
 @RestController
 @RequestMapping("/api/locks")
@@ -80,6 +81,14 @@ public class LockManagementController {
     @DeleteMapping("/{lockKey}")
     public ResponseEntity<Map<String, Object>> cleanupSpecificLock(@PathVariable String lockKey) {
         logger.info("Manual cleanup requested for lock: key={}", lockKey);
+        
+        if (!lockCleanupService.isManagedLockKey(lockKey)) {
+            return ResponseEntity.badRequest().body(Map.of(
+                    "status", "invalid",
+                    "message", "Only task and execution lock keys can be deleted",
+                    "lockKey", lockKey
+            ));
+        }
         
         boolean cleaned = lockCleanupService.cleanupSpecificLock(lockKey);
         

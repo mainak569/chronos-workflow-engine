@@ -3,6 +3,7 @@ package com.chronos.scheduler.domain;
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.CompoundIndexes;
 import org.springframework.data.mongodb.core.index.Indexed;
@@ -21,7 +22,11 @@ import java.util.Map;
 @Document(collection = "task_executions")
 @CompoundIndexes({
     @CompoundIndex(name = "execution_task_idx", def = "{'executionId': 1, 'taskId': 1}", unique = true),
-    @CompoundIndex(name = "execution_status_idx", def = "{'executionId': 1, 'status': 1}")
+    @CompoundIndex(name = "execution_status_idx", def = "{'executionId': 1, 'status': 1}"),
+    // Recovery queries of the scheduler: due retries, stale dispatches, tasks of a lost worker
+    @CompoundIndex(name = "status_retry_idx", def = "{'status': 1, 'nextRetryAt': 1}"),
+    @CompoundIndex(name = "status_dispatched_idx", def = "{'status': 1, 'dispatchedAt': 1}"),
+    @CompoundIndex(name = "status_worker_idx", def = "{'status': 1, 'workerId': 1}")
 })
 public class TaskExecution {
     
@@ -145,7 +150,38 @@ public class TaskExecution {
     /**
      * Version for optimistic locking.
      */
+    @Version
     private Long version;
+    
+    /**
+     * Timestamp when a TaskReady event was issued for the current attempt.
+     * Null means the current attempt has not been dispatched yet.
+     */
+    private Instant dispatchedAt;
+
+    /**
+     * Retry backoff settings copied from the task definition's retry configuration.
+     * Null values fall back to the scheduler defaults.
+     */
+    private Long retryInitialDelayMs;
+    private Double retryBackoffMultiplier;
+    private Long retryMaxDelayMs;
+
+    /**
+     * Maximum execution time of one attempt in milliseconds (from the task definition).
+     * Workers abort attempts that exceed it and report a retriable timeout failure.
+     */
+    private Long timeoutMs;
+
+    /**
+     * Timestamp of the last failed attempt.
+     */
+    private Instant lastAttemptAt;
+    
+    /**
+     * Earliest time the next retry attempt may be dispatched (null if not waiting for a retry).
+     */
+    private Instant nextRetryAt;
     
     // Constructors
     public TaskExecution() {
@@ -194,6 +230,7 @@ public class TaskExecution {
         this.errorMessage = errorMessage;
         this.errorType = errorType;
         this.retriable = retriable;
+        this.lastAttemptAt = Instant.now();
         this.completedAt = Instant.now();
         if (this.startedAt != null) {
             this.durationMs = this.completedAt.toEpochMilli() - this.startedAt.toEpochMilli();
@@ -213,6 +250,54 @@ public class TaskExecution {
         if (this.startedAt != null) {
             this.durationMs = this.completedAt.toEpochMilli() - this.startedAt.toEpochMilli();
         }
+    }
+    
+    /**
+     * Put a failed RUNNING attempt back to PENDING for another attempt.
+     * Increments the attempt number and clears dispatch/worker state so the
+     * task is dispatched again once {@code nextRetryAt} has passed.
+     */
+    public void scheduleRetry(String errorMessage, String errorType, Instant nextRetryAt) {
+        if (this.status != ExecutionStatus.RUNNING) {
+            throw new IllegalStateException("Only RUNNING tasks can be retried, current status: " + status);
+        }
+        if (!canRetry()) {
+            throw new IllegalStateException("Task cannot be retried: attemptNumber=" + attemptNumber + ", maxRetries=" + maxRetries);
+        }
+        this.attemptNumber++;
+        this.status = ExecutionStatus.PENDING;
+        this.errorMessage = errorMessage;
+        this.errorType = errorType;
+        this.lastAttemptAt = Instant.now();
+        this.nextRetryAt = nextRetryAt;
+        this.dispatchedAt = null;
+        this.workerId = null;
+        this.startedAt = null;
+    }
+    
+    /**
+     * Return a RUNNING task whose worker disappeared to PENDING without consuming an attempt.
+     */
+    public void requeue() {
+        if (this.status != ExecutionStatus.RUNNING) {
+            throw new IllegalStateException("Only RUNNING tasks can be requeued, current status: " + status);
+        }
+        this.status = ExecutionStatus.PENDING;
+        this.dispatchedAt = null;
+        this.workerId = null;
+        this.startedAt = null;
+        this.nextRetryAt = null;
+    }
+    
+    /**
+     * Check whether this task can be dispatched now: PENDING, not yet dispatched for the
+     * current attempt, past its retry backoff, and with all dependencies completed.
+     */
+    public boolean isDispatchable(Map<String, TaskExecution> taskExecutions, Instant now) {
+        return status == ExecutionStatus.PENDING
+                && dispatchedAt == null
+                && (nextRetryAt == null || !now.isBefore(nextRetryAt))
+                && areDependenciesSatisfied(taskExecutions);
     }
     
     /**
@@ -425,6 +510,62 @@ public class TaskExecution {
 
     public void setVersion(Long version) {
         this.version = version;
+    }
+
+    public Instant getDispatchedAt() {
+        return dispatchedAt;
+    }
+
+    public void setDispatchedAt(Instant dispatchedAt) {
+        this.dispatchedAt = dispatchedAt;
+    }
+
+    public Long getRetryInitialDelayMs() {
+        return retryInitialDelayMs;
+    }
+
+    public void setRetryInitialDelayMs(Long retryInitialDelayMs) {
+        this.retryInitialDelayMs = retryInitialDelayMs;
+    }
+
+    public Double getRetryBackoffMultiplier() {
+        return retryBackoffMultiplier;
+    }
+
+    public void setRetryBackoffMultiplier(Double retryBackoffMultiplier) {
+        this.retryBackoffMultiplier = retryBackoffMultiplier;
+    }
+
+    public Long getRetryMaxDelayMs() {
+        return retryMaxDelayMs;
+    }
+
+    public void setRetryMaxDelayMs(Long retryMaxDelayMs) {
+        this.retryMaxDelayMs = retryMaxDelayMs;
+    }
+
+    public Long getTimeoutMs() {
+        return timeoutMs;
+    }
+
+    public void setTimeoutMs(Long timeoutMs) {
+        this.timeoutMs = timeoutMs;
+    }
+
+    public Instant getLastAttemptAt() {
+        return lastAttemptAt;
+    }
+
+    public void setLastAttemptAt(Instant lastAttemptAt) {
+        this.lastAttemptAt = lastAttemptAt;
+    }
+
+    public Instant getNextRetryAt() {
+        return nextRetryAt;
+    }
+
+    public void setNextRetryAt(Instant nextRetryAt) {
+        this.nextRetryAt = nextRetryAt;
     }
     
     // Builder

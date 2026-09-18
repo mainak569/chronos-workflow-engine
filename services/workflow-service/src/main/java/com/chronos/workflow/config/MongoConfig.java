@@ -1,15 +1,14 @@
 package com.chronos.workflow.config;
 
 import org.springframework.context.annotation.Configuration;
-import org.springframework.data.mongodb.config.EnableMongoAuditing;
 import org.springframework.data.mongodb.repository.config.EnableMongoRepositories;
 
 /**
  * MongoDB configuration.
- * Enables auditing for automatic createdAt/updatedAt timestamps.
+ * Auditing (createdAt/updatedAt) is enabled on WorkflowServiceApplication so that
+ * test slices such as @DataMongoTest pick it up as well.
  */
 @Configuration
-@EnableMongoAuditing
 @EnableMongoRepositories(basePackages = "com.chronos.workflow.repository")
 public class MongoConfig {
 }

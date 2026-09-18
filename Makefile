@@ -172,7 +172,7 @@ app-up:
 	@echo "  API Gateway:        http://localhost:8080"
 	@echo "  Workflow Service:   http://localhost:8081"
 	@echo "  Scheduler Service:  http://localhost:8082"
-	@echo "  Worker Service:     http://localhost:8083"
+	@echo "  Worker Service:     ports 8083-8093 (one per replica, see docker compose ps)"
 	@echo ""
 	@echo "Use 'make app-logs' to view logs."
 
@@ -221,28 +221,31 @@ health:
 	@echo "Checking health of all services..."
 	@echo ""
 	@echo "API Gateway:"
-	@curl -s http://localhost:8080/actuator/health | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
+	@curl -s http://localhost:8080/readyz | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
 	@echo ""
 	@echo "Workflow Service:"
-	@curl -s http://localhost:8081/actuator/health | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
+	@curl -s http://localhost:8081/readyz | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
 	@echo ""
 	@echo "Scheduler Service:"
-	@curl -s http://localhost:8082/actuator/health | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
+	@curl -s http://localhost:8082/readyz | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
 	@echo ""
-	@echo "Worker Service:"
-	@curl -s http://localhost:8083/actuator/health | grep -q UP && echo "  ✓ UP" || echo "  ✗ DOWN"
+	@echo "Worker Service (each replica gets its own host port):"
+	@for c in $$(docker compose ps -q worker-service); do \
+		name=$$(docker inspect -f '{{.Name}}' $$c | tr -d /); \
+		port=$$(docker port $$c 8083/tcp | head -n 1 | cut -d: -f2); \
+		curl -s http://localhost:$$port/readyz | grep -q UP && echo "  ✓ $$name UP (port $$port)" || echo "  ✗ $$name DOWN (port $$port)"; \
+	done
 	@echo ""
 
 metrics:
-	@echo "Prometheus Metrics URLs:"
+	@echo "Metrics (actuator runs on management ports 9080-9083 inside the Docker network):"
 	@echo ""
-	@echo "API Gateway:        http://localhost:8080/actuator/prometheus"
-	@echo "Workflow Service:   http://localhost:8081/actuator/prometheus"
-	@echo "Scheduler Service:  http://localhost:8082/actuator/prometheus"
-	@echo "Worker Service:     http://localhost:8083/actuator/prometheus"
+	@echo "Grafana dashboard:  http://localhost:3000/d/chronos-overview (admin/admin)"
+	@echo "Prometheus targets: http://localhost:9090/targets"
+	@echo "Prometheus alerts:  http://localhost:9090/alerts"
 	@echo ""
-	@echo "Prometheus UI:      http://localhost:9090"
-	@echo "Grafana:            http://localhost:3000"
+	@echo "Raw metrics of one service, e.g.:"
+	@echo "  docker compose exec workflow-service wget -qO- localhost:9081/actuator/prometheus | grep chronos_"
 
 # ============================================================================
 # Cleanup Commands

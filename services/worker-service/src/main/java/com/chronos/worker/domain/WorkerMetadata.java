@@ -80,7 +80,8 @@ public class WorkerMetadata {
      * Transition to AVAILABLE state.
      */
     public void markAvailable() {
-        if (this.status != null) {
+        // Idempotent: a worker runs several tasks concurrently, so it may already be AVAILABLE
+        if (this.status != null && this.status != WorkerStatus.AVAILABLE) {
             this.status.validateTransition(WorkerStatus.AVAILABLE);
         }
         this.status = WorkerStatus.AVAILABLE;
@@ -92,7 +93,8 @@ public class WorkerMetadata {
      * Transition to BUSY state.
      */
     public void markBusy(String executionId, String taskId) {
-        if (this.status != null) {
+        // Idempotent: a worker runs several tasks concurrently, so it may already be BUSY
+        if (this.status != null && this.status != WorkerStatus.BUSY) {
             this.status.validateTransition(WorkerStatus.BUSY);
         }
         this.status = WorkerStatus.BUSY;

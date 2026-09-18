@@ -7,174 +7,106 @@ import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Component;
 
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Publisher for task and worker lifecycle events.
  * Uses executionId as message key for task events, workerId for worker events.
+ *
+ * Task completion and failure events are sent synchronously: if the broker does not
+ * confirm them, an exception is thrown so the TaskReady record is not acknowledged
+ * and will be redelivered, instead of the result being silently lost.
  */
 @Component
 public class WorkerEventPublisher {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerEventPublisher.class);
 
-    private final KafkaTemplate<String, TaskStartedEvent> taskStartedTemplate;
-    private final KafkaTemplate<String, TaskCompletedEvent> taskCompletedTemplate;
-    private final KafkaTemplate<String, TaskFailedEvent> taskFailedTemplate;
-    private final KafkaTemplate<String, WorkerRegisteredEvent> workerRegisteredTemplate;
-    private final KafkaTemplate<String, WorkerUnavailableEvent> workerUnavailableTemplate;
+    private static final long SEND_TIMEOUT_SECONDS = 30;
 
-    public WorkerEventPublisher(
-            KafkaTemplate<String, TaskStartedEvent> taskStartedTemplate,
-            KafkaTemplate<String, TaskCompletedEvent> taskCompletedTemplate,
-            KafkaTemplate<String, TaskFailedEvent> taskFailedTemplate,
-            KafkaTemplate<String, WorkerRegisteredEvent> workerRegisteredTemplate,
-            KafkaTemplate<String, WorkerUnavailableEvent> workerUnavailableTemplate) {
-        this.taskStartedTemplate = taskStartedTemplate;
-        this.taskCompletedTemplate = taskCompletedTemplate;
-        this.taskFailedTemplate = taskFailedTemplate;
-        this.workerRegisteredTemplate = workerRegisteredTemplate;
-        this.workerUnavailableTemplate = workerUnavailableTemplate;
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    public WorkerEventPublisher(KafkaTemplate<String, Object> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     /**
-     * Publish TaskStartedEvent to Kafka.
-     * Uses executionId as message key for ordering.
-     *
-     * @param event The task started event
+     * Publish TaskStartedEvent (best effort; the completion event also implies the start).
      */
     public void publishTaskStarted(TaskStartedEvent event) {
-        String messageKey = event.getExecutionId();
-
-        log.info("Publishing TaskStartedEvent: executionId={}, taskId={}, workerId={}, eventId={}",
-                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), event.getEventId());
-
-        CompletableFuture<SendResult<String, TaskStartedEvent>> future =
-                taskStartedTemplate.send(KafkaTopics.TASK_STARTED, messageKey, event);
-
-        future.whenComplete((result, ex) -> {
-            if (ex == null) {
-                log.info("Successfully published TaskStartedEvent: executionId={}, taskId={}, partition={}, offset={}",
-                        event.getExecutionId(), event.getTaskId(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
-            } else {
-                log.error("Failed to publish TaskStartedEvent: executionId={}, taskId={}, error={}",
-                        event.getExecutionId(), event.getTaskId(), ex.getMessage(), ex);
-            }
-        });
+        log.info("Publishing TaskStartedEvent: executionId={}, taskId={}, workerId={}, attempt={}, eventId={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(),
+                event.getAttemptNumber(), event.getEventId());
+        sendAsync(KafkaTopics.TASK_STARTED, event.getExecutionId(), event, "TaskStartedEvent");
     }
 
     /**
-     * Publish TaskCompletedEvent to Kafka.
-     * Uses executionId as message key for ordering.
-     *
-     * @param event The task completed event
+     * Publish TaskCompletedEvent and wait for broker confirmation.
      */
     public void publishTaskCompleted(TaskCompletedEvent event) {
-        String messageKey = event.getExecutionId();
-
-        log.info("Publishing TaskCompletedEvent: executionId={}, taskId={}, workerId={}, eventId={}",
-                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), event.getEventId());
-
-        CompletableFuture<SendResult<String, TaskCompletedEvent>> future =
-                taskCompletedTemplate.send(KafkaTopics.TASK_COMPLETED, messageKey, event);
-
-        future.whenComplete((result, ex) -> {
-            if (ex == null) {
-                log.info("Successfully published TaskCompletedEvent: executionId={}, taskId={}, partition={}, offset={}",
-                        event.getExecutionId(), event.getTaskId(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
-            } else {
-                log.error("Failed to publish TaskCompletedEvent: executionId={}, taskId={}, error={}",
-                        event.getExecutionId(), event.getTaskId(), ex.getMessage(), ex);
-            }
-        });
+        log.info("Publishing TaskCompletedEvent: executionId={}, taskId={}, workerId={}, attempt={}, eventId={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(),
+                event.getAttemptNumber(), event.getEventId());
+        sendSync(KafkaTopics.TASK_COMPLETED, event.getExecutionId(), event, "TaskCompletedEvent");
     }
 
     /**
-     * Publish TaskFailedEvent to Kafka.
-     * Uses executionId as message key for ordering.
-     *
-     * @param event The task failed event
+     * Publish TaskFailedEvent and wait for broker confirmation.
      */
     public void publishTaskFailed(TaskFailedEvent event) {
-        String messageKey = event.getExecutionId();
-
-        log.info("Publishing TaskFailedEvent: executionId={}, taskId={}, workerId={}, retriable={}, eventId={}",
-                event.getExecutionId(), event.getTaskId(), event.getWorkerId(), 
-                event.isRetriable(), event.getEventId());
-
-        CompletableFuture<SendResult<String, TaskFailedEvent>> future =
-                taskFailedTemplate.send(KafkaTopics.TASK_FAILED, messageKey, event);
-
-        future.whenComplete((result, ex) -> {
-            if (ex == null) {
-                log.info("Successfully published TaskFailedEvent: executionId={}, taskId={}, partition={}, offset={}",
-                        event.getExecutionId(), event.getTaskId(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
-            } else {
-                log.error("Failed to publish TaskFailedEvent: executionId={}, taskId={}, error={}",
-                        event.getExecutionId(), event.getTaskId(), ex.getMessage(), ex);
-            }
-        });
+        log.info("Publishing TaskFailedEvent: executionId={}, taskId={}, workerId={}, attempt={}, retriable={}, eventId={}",
+                event.getExecutionId(), event.getTaskId(), event.getWorkerId(),
+                event.getAttemptNumber(), event.isRetriable(), event.getEventId());
+        sendSync(KafkaTopics.TASK_FAILED, event.getExecutionId(), event, "TaskFailedEvent");
     }
 
     /**
-     * Publish WorkerRegisteredEvent to Kafka.
-     * Uses workerId as message key for consistent worker tracking.
-     *
-     * @param event The worker registered event
+     * Publish WorkerRegisteredEvent.
      */
     public void publishWorkerRegistered(WorkerRegisteredEvent event) {
-        String messageKey = event.getWorkerId();
-
         log.info("Publishing WorkerRegisteredEvent: workerId={}, taskTypes={}, eventId={}",
                 event.getWorkerId(), event.getSupportedTaskTypes(), event.getEventId());
+        sendAsync(KafkaTopics.WORKER_REGISTERED, event.getWorkerId(), event, "WorkerRegisteredEvent");
+    }
 
-        CompletableFuture<SendResult<String, WorkerRegisteredEvent>> future =
-                workerRegisteredTemplate.send(KafkaTopics.WORKER_REGISTERED, messageKey, event);
+    /**
+     * Publish WorkerUnavailableEvent and wait for confirmation (sent during shutdown).
+     */
+    public void publishWorkerUnavailable(WorkerUnavailableEvent event) {
+        log.info("Publishing WorkerUnavailableEvent: workerId={}, reason={}, eventId={}",
+                event.getWorkerId(), event.getReason(), event.getEventId());
+        sendSync(KafkaTopics.WORKER_UNAVAILABLE, event.getWorkerId(), event, "WorkerUnavailableEvent");
+    }
 
-        future.whenComplete((result, ex) -> {
+    private void sendAsync(String topic, String key, Object event, String eventName) {
+        kafkaTemplate.send(topic, key, event).whenComplete((result, ex) -> {
             if (ex == null) {
-                log.info("Successfully published WorkerRegisteredEvent: workerId={}, partition={}, offset={}",
-                        event.getWorkerId(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
+                logPublished(eventName, key, result);
             } else {
-                log.error("Failed to publish WorkerRegisteredEvent: workerId={}, error={}",
-                        event.getWorkerId(), ex.getMessage(), ex);
+                log.error("Failed to publish {}: key={}, error={}", eventName, key, ex.getMessage(), ex);
             }
         });
     }
 
-    /**
-     * Publish WorkerUnavailableEvent to Kafka.
-     * Uses workerId as message key for consistent worker tracking.
-     *
-     * @param event The worker unavailable event
-     */
-    public void publishWorkerUnavailable(WorkerUnavailableEvent event) {
-        String messageKey = event.getWorkerId();
+    private void sendSync(String topic, String key, Object event, String eventName) {
+        try {
+            SendResult<String, Object> result = kafkaTemplate.send(topic, key, event)
+                    .get(SEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            logPublished(eventName, key, result);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while publishing " + eventName, e);
+        } catch (ExecutionException | TimeoutException e) {
+            log.error("Failed to publish {}: key={}, error={}", eventName, key, e.getMessage(), e);
+            throw new IllegalStateException("Failed to publish " + eventName, e);
+        }
+    }
 
-        log.info("Publishing WorkerUnavailableEvent: workerId={}, reason={}, eventId={}",
-                event.getWorkerId(), event.getReason(), event.getEventId());
-
-        CompletableFuture<SendResult<String, WorkerUnavailableEvent>> future =
-                workerUnavailableTemplate.send(KafkaTopics.WORKER_UNAVAILABLE, messageKey, event);
-
-        future.whenComplete((result, ex) -> {
-            if (ex == null) {
-                log.info("Successfully published WorkerUnavailableEvent: workerId={}, partition={}, offset={}",
-                        event.getWorkerId(),
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset());
-            } else {
-                log.error("Failed to publish WorkerUnavailableEvent: workerId={}, error={}",
-                        event.getWorkerId(), ex.getMessage(), ex);
-            }
-        });
+    private void logPublished(String eventName, String key, SendResult<String, Object> result) {
+        log.debug("Published {}: key={}, topic={}, partition={}, offset={}",
+                eventName, key, result.getRecordMetadata().topic(),
+                result.getRecordMetadata().partition(), result.getRecordMetadata().offset());
     }
 }

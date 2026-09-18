@@ -3,6 +3,8 @@ package com.chronos.workflow.config;
 import com.chronos.workflow.security.JwtAuthenticationFilter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
@@ -12,13 +14,20 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+import java.io.IOException;
+import java.time.Instant;
+
 /**
  * Spring Security configuration for JWT-based authentication.
  * 
  * Configuration:
  * - Stateless session (no server-side session)
  * - JWT authentication filter before Spring's authentication filter
- * - Public endpoints: /auth/** , /actuator/health
+ * - Public endpoints: /auth/** , /actuator/health, /actuator/info, /actuator/prometheus, /livez, /readyz
+ * - Missing/invalid token: 401, authenticated but not allowed: 403 (JSON bodies)
  * - All other endpoints require authentication
  * - CSRF disabled (not needed for JWT)
  * - BCrypt password encoder with strength 10
@@ -59,7 +68,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         // Public endpoints
                         .requestMatchers("/api/v1/auth/**").permitAll()
-                        .requestMatchers("/actuator/health").permitAll()
+                        .requestMatchers("/actuator/health", "/actuator/health/**",
+                                "/actuator/info", "/actuator/prometheus", "/livez", "/readyz").permitAll()
                         .requestMatchers("/swagger-ui/**", "/v3/api-docs/**").permitAll()
                         
                         // All other endpoints require authentication
@@ -67,6 +77,13 @@ public class SecurityConfig {
                 )
                 
                 // Add JWT filter before Spring Security's authentication filter
+                .exceptionHandling(ex -> ex
+                        .authenticationEntryPoint((request, response, e) ->
+                                writeError(request, response, HttpStatus.UNAUTHORIZED, "Authentication required"))
+                        .accessDeniedHandler((request, response, e) ->
+                                writeError(request, response, HttpStatus.FORBIDDEN, "Access denied"))
+                )
+                
                 .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
         
         return http.build();
@@ -83,6 +100,15 @@ public class SecurityConfig {
      * - Stores salt in the hash
      * - Provides timing-attack resistance
      */
+    private static void writeError(HttpServletRequest request, HttpServletResponse response,
+                                   HttpStatus status, String message) throws IOException {
+        response.setStatus(status.value());
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.getWriter().write(String.format(
+                "{\"timestamp\":\"%s\",\"status\":%d,\"error\":\"%s\",\"message\":\"%s\",\"path\":\"%s\"}",
+                Instant.now(), status.value(), status.name(), message, request.getRequestURI().replace("\"", "")));
+    }
+    
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder(10);

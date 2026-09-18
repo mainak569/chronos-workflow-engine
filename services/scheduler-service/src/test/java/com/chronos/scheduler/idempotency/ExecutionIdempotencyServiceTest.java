@@ -35,7 +35,7 @@ class ExecutionIdempotencyServiceTest {
     
     @BeforeEach
     void setUp() {
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
+        lenient().when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         idempotencyService = new ExecutionIdempotencyService(redisTemplate);
     }
     
@@ -43,7 +43,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetExistingExecution_Found() {
         // Given: Execution already exists
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(valueOperations.get(idempotencyKey)).thenReturn(EXECUTION_ID);
         
@@ -59,7 +59,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetExistingExecution_NotFound() {
         // Given: No execution exists
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(valueOperations.get(idempotencyKey)).thenReturn(null);
         
@@ -74,7 +74,7 @@ class ExecutionIdempotencyServiceTest {
     void testRecordExecution_FirstTime() {
         // Given: No existing execution
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(valueOperations.setIfAbsent(
                 eq(idempotencyKey),
@@ -100,7 +100,7 @@ class ExecutionIdempotencyServiceTest {
     void testRecordExecution_Duplicate() {
         // Given: Execution already exists
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(valueOperations.setIfAbsent(
                 eq(idempotencyKey),
@@ -121,7 +121,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetOrCreateExecution_ExistingFound() {
         // Given: Execution already exists
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         String existingExecutionId = "exec-existing";
         
         when(valueOperations.get(idempotencyKey)).thenReturn(existingExecutionId);
@@ -142,7 +142,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetOrCreateExecution_NewCreated() {
         // Given: No existing execution
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(valueOperations.get(idempotencyKey)).thenReturn(null);
         when(valueOperations.setIfAbsent(
@@ -173,7 +173,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetOrCreateExecution_RaceCondition() {
         // Given: Execution doesn't exist on first check, but created by another scheduler before record
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         String existingExecutionId = "exec-from-other-scheduler";
         
         when(valueOperations.get(idempotencyKey))
@@ -202,7 +202,7 @@ class ExecutionIdempotencyServiceTest {
     void testRemoveIdempotencyRecord() {
         // Given: Idempotency record exists
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(redisTemplate.delete(idempotencyKey)).thenReturn(true);
         
@@ -218,7 +218,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetRemainingTtl_KeyExists() {
         // Given: Key exists with TTL
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(redisTemplate.getExpire(idempotencyKey, TimeUnit.SECONDS)).thenReturn(3000L);
         
@@ -233,7 +233,7 @@ class ExecutionIdempotencyServiceTest {
     void testGetRemainingTtl_KeyDoesNotExist() {
         // Given: Key doesn't exist
         Instant scheduledTime = Instant.parse("2026-09-15T10:00:00Z");
-        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00";
+        String idempotencyKey = "chronos:execution:idempotency:" + WORKFLOW_ID + ":2026-09-15T10:00:00";
         
         when(redisTemplate.getExpire(idempotencyKey, TimeUnit.SECONDS)).thenReturn(-2L);
         

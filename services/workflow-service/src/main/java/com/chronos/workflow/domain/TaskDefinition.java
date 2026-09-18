@@ -56,6 +56,7 @@ public class TaskDefinition {
      * Maximum time (in milliseconds) this task is allowed to run.
      * Worker will timeout the task after this duration.
      */
+    @jakarta.validation.constraints.Positive(message = "Timeout must be positive")
     private Long timeoutMs = 300000L; // 5 minutes default
 
     /**
@@ -110,7 +111,7 @@ public class TaskDefinition {
     }
 
     public void setDependencies(Set<String> dependencies) {
-        this.dependencies = dependencies;
+        this.dependencies = dependencies != null ? dependencies : new HashSet<>();
     }
 
     public Map<String, Object> getConfiguration() {
@@ -118,7 +119,7 @@ public class TaskDefinition {
     }
 
     public void setConfiguration(Map<String, Object> configuration) {
-        this.configuration = configuration;
+        this.configuration = configuration != null ? configuration : new HashMap<>();
     }
 
     public RetryConfiguration getRetryConfig() {
@@ -126,7 +127,7 @@ public class TaskDefinition {
     }
 
     public void setRetryConfig(RetryConfiguration retryConfig) {
-        this.retryConfig = retryConfig;
+        this.retryConfig = retryConfig != null ? retryConfig : RetryConfiguration.builder().build();
     }
 
     public Long getTimeoutMs() {
@@ -134,7 +135,7 @@ public class TaskDefinition {
     }
 
     public void setTimeoutMs(Long timeoutMs) {
-        this.timeoutMs = timeoutMs;
+        this.timeoutMs = timeoutMs != null ? timeoutMs : 300000L;
     }
 
     public String getDescription() {

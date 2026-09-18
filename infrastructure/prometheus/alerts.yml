@@ -1,81 +1,70 @@
+# Chronos alert rules, evaluated by Prometheus (see rule_files in prometheus.yml).
+# Every expression uses metrics the services actually export at /actuator/prometheus.
 groups:
-  - name: chronos_alerts
-    interval: 30s
+  - name: chronos-availability
     rules:
-      # Service availability alerts
       - alert: ServiceDown
-        expr: up == 0
+        expr: up{job=~"api-gateway|workflow-service|scheduler-service|worker-service"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "Service {{ $labels.job }} is down"
-          description: "{{ $labels.job }} has been down for more than 1 minute"
+          summary: "{{ $labels.job }} instance {{ $labels.instance }} is down"
+          description: "Prometheus has not been able to scrape {{ $labels.instance }} for over 1 minute."
 
-      # MongoDB alerts
-      - alert: MongoDBDown
-        expr: mongodb_up == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "MongoDB is down"
-          description: "MongoDB has been unavailable for more than 1 minute"
-
-      # Kafka alerts
-      - alert: KafkaDown
-        expr: kafka_server_replicamanager_leadercount == 0
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Kafka broker is down"
-          description: "Kafka broker has no leaders for more than 2 minutes"
-
-      - alert: KafkaConsumerLagHigh
-        expr: kafka_consumer_lag > 1000
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High Kafka consumer lag"
-          description: "Consumer lag is above 1000 messages for more than 5 minutes"
-
-      # Redis alerts
-      - alert: RedisDown
-        expr: redis_up == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Redis is down"
-          description: "Redis has been unavailable for more than 1 minute"
-
-      # Worker alerts
       - alert: NoWorkersAvailable
-        expr: worker_available_count == 0
+        expr: absent(up{job="worker-service"} == 1)
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No worker instances are running"
+          description: "Dispatched tasks will not be executed until a worker comes back."
+
+      - alert: NoSchedulerLeader
+        expr: sum(chronos_scheduler_leader) < 1
         for: 2m
         labels:
-          severity: warning
+          severity: critical
         annotations:
-          summary: "No workers available"
-          description: "All workers are unavailable for more than 2 minutes"
+          summary: "No scheduler instance holds leadership"
+          description: "Retries, recovery sweeps, cron schedules and the outbox publisher only run on the leader."
 
-      # Task execution alerts
-      - alert: HighTaskFailureRate
-        expr: rate(task_failed_total[5m]) > 0.1
+  - name: chronos-execution
+    rules:
+      - alert: HighWorkflowFailureRate
+        expr: |
+          sum(rate(chronos_workflow_executions_total{status="FAILED"}[10m]))
+            / sum(rate(chronos_workflow_executions_total{status=~"COMPLETED|FAILED"}[10m])) > 0.2
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High task failure rate"
-          description: "Task failure rate is above 10% for more than 5 minutes"
+          summary: "More than 20% of workflow executions are failing"
+          description: "Failure ratio over the last 10 minutes is {{ $value | humanizePercentage }}."
 
-      - alert: TasksInDeadLetterQueue
-        expr: task_dead_total > 10
+      - alert: TasksDeadLettered
+        expr: sum(increase(chronos_task_dlq_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tasks were moved to the dead letter queue"
+          description: "{{ $value }} task(s) exhausted their retries in the last 15 minutes (topic chronos.task.failed.permanently)."
+
+      - alert: OutboxBacklog
+        expr: max(chronos_outbox_pending) > 100
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Tasks accumulating in dead letter queue"
-          description: "More than 10 tasks in dead letter queue"
+          summary: "Outbox messages are not being published"
+          description: "{{ $value }} TaskReady messages are waiting; check Kafka connectivity and scheduler leadership."
+
+      - alert: KafkaConsumerLag
+        expr: max by (job) (kafka_consumer_fetch_manager_records_lag_max) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }} is falling behind on Kafka"
+          description: "Maximum consumer lag is {{ $value }} records."

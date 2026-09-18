@@ -102,7 +102,6 @@ public class OutboxMessage {
     public void markFailed(String error) {
         this.status = OutboxStatus.FAILED;
         this.lastError = error;
-        this.attemptCount++;
     }
     
     public void incrementAttempt() {

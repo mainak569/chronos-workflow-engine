@@ -7,6 +7,8 @@ import io.github.resilience4j.core.registry.EntryAddedEvent;
 import io.github.resilience4j.core.registry.EntryRemovedEvent;
 import io.github.resilience4j.core.registry.EntryReplacedEvent;
 import io.github.resilience4j.core.registry.RegistryEventConsumer;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -45,18 +47,20 @@ import java.time.Duration;
 public class CircuitBreakerConfiguration {
     
     private static final Logger log = LoggerFactory.getLogger(CircuitBreakerConfiguration.class);
+
+    private static final Duration OPEN_STATE_WAIT_DURATION = Duration.ofSeconds(30);
     
     /**
      * Create circuit breaker registry with custom configuration.
      */
     @Bean
-    public CircuitBreakerRegistry circuitBreakerRegistry() {
+    public CircuitBreakerRegistry circuitBreakerRegistry(MeterRegistry meterRegistry) {
         CircuitBreakerConfig config = CircuitBreakerConfig.custom()
                 // Open circuit if 50% of calls fail
                 .failureRateThreshold(50)
                 
                 // Wait 30 seconds before attempting half-open
-                .waitDurationInOpenState(Duration.ofSeconds(30))
+                .waitDurationInOpenState(OPEN_STATE_WAIT_DURATION)
                 
                 // Allow 5 calls in half-open state to test recovery
                 .permittedNumberOfCallsInHalfOpenState(5)
@@ -86,10 +90,7 @@ public class CircuitBreakerConfiguration {
                 
                 .build();
         
-        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
-        
-        // Register event consumer to log state changes
-        registry.getEventPublisher().onEntryAdded(new RegistryEventConsumer<CircuitBreaker>() {
+        RegistryEventConsumer<CircuitBreaker> stateChangeLogger = new RegistryEventConsumer<>() {
             @Override
             public void onEntryAddedEvent(EntryAddedEvent<CircuitBreaker> event) {
                 CircuitBreaker cb = event.getAddedEntry();
@@ -112,12 +113,18 @@ public class CircuitBreakerConfiguration {
             public void onEntryReplacedEvent(EntryReplacedEvent<CircuitBreaker> entryReplacedEvent) {
                 // No action needed
             }
-        });
+        };
+
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config, stateChangeLogger);
+
+        // Export state, call and failure-rate metrics (resilience4j_circuitbreaker_*) to Prometheus;
+        // this registry replaces the auto-configured one, so the binding has to be done here
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meterRegistry);
         
         log.info("Circuit breaker registry initialized with config: failureThreshold={}%, " +
                         "waitDuration={}s, slidingWindow={}, minCalls={}",
                 config.getFailureRateThreshold(),
-                config.getWaitDurationInOpenState().getSeconds(),
+                OPEN_STATE_WAIT_DURATION.getSeconds(),
                 config.getSlidingWindowSize(),
                 config.getMinimumNumberOfCalls());
         

@@ -2,10 +2,12 @@ package com.chronos.scheduler.repository;
 
 import com.chronos.scheduler.domain.ExecutionStatus;
 import com.chronos.scheduler.domain.TaskExecution;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.mongodb.repository.MongoRepository;
 import org.springframework.data.mongodb.repository.Query;
 import org.springframework.stereotype.Repository;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 
@@ -30,4 +32,22 @@ public interface TaskExecutionRepository extends MongoRepository<TaskExecution, 
     long countByExecutionIdAndStatus(String executionId, ExecutionStatus status);
     
     long countByExecutionId(String executionId);
+    
+    /**
+     * Tasks currently executing on the given worker.
+     */
+    List<TaskExecution> findByStatusAndWorkerId(ExecutionStatus status, String workerId);
+    
+    /**
+     * Retry attempts whose backoff has elapsed but that have not been dispatched yet.
+     */
+    @Query("{ 'status': 'PENDING', 'dispatchedAt': null, 'nextRetryAt': { $lte: ?0 } }")
+    List<TaskExecution> findRetriesDue(Instant now, Pageable pageable);
+    
+    /**
+     * Dispatched attempts that no worker has picked up since the cutoff
+     * (TaskReady lost, dropped by a worker, or the scheduler crashed mid-dispatch).
+     */
+    @Query("{ 'status': 'PENDING', 'dispatchedAt': { $lt: ?0 } }")
+    List<TaskExecution> findStaleDispatches(Instant cutoff, Pageable pageable);
 }

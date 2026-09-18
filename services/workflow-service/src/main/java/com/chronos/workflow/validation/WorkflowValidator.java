@@ -5,8 +5,11 @@ import com.chronos.workflow.domain.Workflow;
 import com.chronos.workflow.exception.WorkflowValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.support.CronExpression;
 import org.springframework.stereotype.Component;
 
+import java.time.DateTimeException;
+import java.time.ZoneId;
 import java.util.*;
 
 /**
@@ -28,10 +31,42 @@ public class WorkflowValidator {
         log.debug("Validating workflow: {}", workflow.getName());
 
         validateTaskIds(workflow);
+        validateSchedule(workflow);
         validateDependencies(workflow);
         detectCycles(workflow);
 
         log.debug("Workflow validation passed: {}", workflow.getName());
+    }
+
+    /**
+     * Validate the optional cron schedule and time zone, normalising blanks to null / UTC.
+     */
+    private void validateSchedule(Workflow workflow) {
+        String schedule = workflow.getSchedule();
+        if (schedule == null || schedule.isBlank()) {
+            if (workflow.getTimezone() != null && !workflow.getTimezone().isBlank()) {
+                throw new WorkflowValidationException("Timezone requires a schedule");
+            }
+            workflow.setSchedule(null);
+            workflow.setTimezone(null);
+            return;
+        }
+
+        if (!CronExpression.isValidExpression(schedule)) {
+            throw new WorkflowValidationException(
+                    "Invalid cron schedule '" + schedule + "' (expected 6 fields: second minute hour day month weekday)");
+        }
+
+        String timezone = workflow.getTimezone();
+        if (timezone == null || timezone.isBlank()) {
+            workflow.setTimezone("UTC");
+        } else {
+            try {
+                ZoneId.of(timezone);
+            } catch (DateTimeException e) {
+                throw new WorkflowValidationException("Invalid timezone: " + timezone);
+            }
+        }
     }
 
     /**

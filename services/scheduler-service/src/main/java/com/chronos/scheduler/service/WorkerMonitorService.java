@@ -1,6 +1,7 @@
 package com.chronos.scheduler.service;
 
 import com.chronos.scheduler.domain.WorkerMetadata;
+import com.chronos.scheduler.leader.LeaderElectionService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -27,10 +28,17 @@ public class WorkerMonitorService {
     
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper;
+    private final LeaderElectionService leaderElectionService;
+    private final WorkerFailureHandler workerFailureHandler;
     
-    public WorkerMonitorService(RedisTemplate<String, String> redisTemplate, ObjectMapper objectMapper) {
+    public WorkerMonitorService(RedisTemplate<String, String> redisTemplate,
+                                ObjectMapper objectMapper,
+                                LeaderElectionService leaderElectionService,
+                                WorkerFailureHandler workerFailureHandler) {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.leaderElectionService = leaderElectionService;
+        this.workerFailureHandler = workerFailureHandler;
     }
     
     /**
@@ -39,6 +47,9 @@ public class WorkerMonitorService {
      */
     @Scheduled(fixedRateString = "${worker.monitor.interval:15000}")
     public void monitorWorkerHeartbeats() {
+        if (!leaderElectionService.isLeader()) {
+            return;
+        }
         try {
             List<WorkerMetadata> expiredWorkers = findWorkersWithExpiredHeartbeats();
             
@@ -139,7 +150,7 @@ public class WorkerMonitorService {
     
     /**
      * Mark worker as unavailable.
-     * Updates status in Redis metadata.
+     * Updates status in Redis metadata and requeues the tasks it was running.
      */
     private void markWorkerUnavailable(String workerId) {
         try {
@@ -159,8 +170,9 @@ public class WorkerMonitorService {
             String metadataJson = objectMapper.writeValueAsString(worker);
             redisTemplate.opsForValue().set(metadataKey, metadataJson);
             
-            // TODO: Publish WorkerUnavailable event for task reassignment
-            
+            // Tasks the dead worker was running will never report back: run them again
+            workerFailureHandler.handleWorkerLost(workerId);
+
         } catch (Exception e) {
             log.error("Failed to mark worker as unavailable: {}", workerId, e);
         }

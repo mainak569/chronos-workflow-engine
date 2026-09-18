@@ -4,7 +4,10 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.validation.BindingResult;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -110,6 +113,77 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * Handle missing executions or tasks (including ones owned by other users).
+     */
+    @ExceptionHandler(ExecutionNotFoundException.class)
+    public ResponseEntity<ErrorResponse> handleExecutionNotFoundException(
+            ExecutionNotFoundException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.NOT_FOUND, "EXECUTION_NOT_FOUND", ex.getMessage(), request);
+    }
+
+    /**
+     * Handle operations that are invalid for the execution's current state.
+     */
+    @ExceptionHandler(InvalidExecutionStateException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidExecutionStateException(
+            InvalidExecutionStateException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.CONFLICT, "INVALID_EXECUTION_STATE", ex.getMessage(), request);
+    }
+
+    /**
+     * Handle concurrent modification of the same document.
+     */
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handleOptimisticLockingFailure(
+            OptimisticLockingFailureException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.CONFLICT, "CONCURRENT_MODIFICATION",
+                "The resource was modified concurrently, please retry", request);
+    }
+
+    /**
+     * Handle duplicate resources (e.g. an email that is already registered).
+     */
+    @ExceptionHandler(DuplicateResourceException.class)
+    public ResponseEntity<ErrorResponse> handleDuplicateResourceException(
+            DuplicateResourceException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.CONFLICT, "DUPLICATE_RESOURCE", ex.getMessage(), request);
+    }
+
+    /**
+     * Handle failed logins and invalid tokens.
+     */
+    @ExceptionHandler(AuthenticationException.class)
+    public ResponseEntity<ErrorResponse> handleAuthenticationException(
+            AuthenticationException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.UNAUTHORIZED, "AUTHENTICATION_FAILED", ex.getMessage(), request);
+    }
+
+    /**
+     * Handle access to resources the user may not use.
+     */
+    @ExceptionHandler({ForbiddenException.class, AccessDeniedException.class})
+    public ResponseEntity<ErrorResponse> handleForbiddenException(
+            RuntimeException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.FORBIDDEN, "FORBIDDEN", ex.getMessage(), request);
+    }
+
+    /**
+     * Handle malformed or unreadable request bodies.
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ErrorResponse> handleUnreadableMessage(
+            HttpMessageNotReadableException ex,
+            HttpServletRequest request) {
+        return buildError(HttpStatus.BAD_REQUEST, "MALFORMED_REQUEST", "Request body is missing or malformed", request);
+    }
+
+    /**
      * Handle all other unexpected exceptions.
      */
     @ExceptionHandler(Exception.class)
@@ -137,6 +211,24 @@ public class GlobalExceptionHandler {
     /**
      * Generate a unique correlation ID for error tracking.
      */
+    private ResponseEntity<ErrorResponse> buildError(HttpStatus status, String error, String message,
+                                                     HttpServletRequest request) {
+        String correlationId = generateCorrelationId();
+
+        log.warn("{} - correlationId: {}, message: {}", error, correlationId, message);
+
+        ErrorResponse body = ErrorResponse.builder()
+                .timestamp(Instant.now())
+                .status(status.value())
+                .error(error)
+                .message(message)
+                .path(request.getRequestURI())
+                .correlationId(correlationId)
+                .build();
+
+        return ResponseEntity.status(status).body(body);
+    }
+
     private String generateCorrelationId() {
         return UUID.randomUUID().toString();
     }

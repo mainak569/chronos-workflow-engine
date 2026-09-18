@@ -2,6 +2,10 @@ package com.chronos.workflow.service;
 
 import com.chronos.workflow.domain.*;
 import com.chronos.workflow.event.WorkflowEventPublisher;
+import com.chronos.workflow.metrics.WorkflowMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import com.chronos.workflow.exception.ExecutionNotFoundException;
+import com.chronos.workflow.exception.InvalidExecutionStateException;
 import com.chronos.workflow.exception.WorkflowNotFoundException;
 import com.chronos.workflow.repository.TaskExecutionRepository;
 import com.chronos.workflow.repository.WorkflowExecutionRepository;
@@ -46,7 +50,8 @@ class WorkflowExecutionServiceTest {
                 workflowRepository,
                 executionRepository,
                 taskExecutionRepository,
-                eventPublisher
+                eventPublisher,
+                new WorkflowMetrics(new SimpleMeterRegistry())
         );
     }
     
@@ -54,11 +59,11 @@ class WorkflowExecutionServiceTest {
     void testStartExecution_SimpleWorkflow() {
         // Arrange
         String workflowId = "wf-123";
-        String triggeredBy = "user-456";
+        String triggeredBy = "owner-123";
         Map<String, Object> input = Map.of("key", "value");
         
         Workflow workflow = createSimpleWorkflow(workflowId);
-        when(workflowRepository.findById(workflowId)).thenReturn(Optional.of(workflow));
+        when(workflowRepository.findByIdAndOwnerId(workflowId, triggeredBy)).thenReturn(Optional.of(workflow));
         
         WorkflowExecution savedExecution = WorkflowExecution.builder()
                 .id("exec-789")
@@ -68,6 +73,7 @@ class WorkflowExecutionServiceTest {
                 .status(ExecutionStatus.PENDING)
                 .input(input)
                 .build();
+        savedExecution.setOwnerId(triggeredBy);
         when(executionRepository.save(any(WorkflowExecution.class))).thenReturn(savedExecution);
         
         // Act
@@ -80,8 +86,10 @@ class WorkflowExecutionServiceTest {
         assertEquals(ExecutionStatus.PENDING, result.getStatus());
         assertEquals(input, result.getInput());
         
-        verify(workflowRepository).findById(workflowId);
-        verify(executionRepository).save(any(WorkflowExecution.class));
+        verify(workflowRepository).findByIdAndOwnerId(workflowId, triggeredBy);
+        ArgumentCaptor<WorkflowExecution> executionCaptor = ArgumentCaptor.forClass(WorkflowExecution.class);
+        verify(executionRepository).save(executionCaptor.capture());
+        assertEquals("owner-123", executionCaptor.getValue().getOwnerId());
         verify(taskExecutionRepository).saveAll(anyList());
         verify(eventPublisher).publishWorkflowCreated(any(WorkflowExecution.class));
     }
@@ -90,13 +98,13 @@ class WorkflowExecutionServiceTest {
     void testStartExecution_WorkflowNotFound() {
         // Arrange
         String workflowId = "non-existent";
-        when(workflowRepository.findById(workflowId)).thenReturn(Optional.empty());
+        when(workflowRepository.findByIdAndOwnerId(workflowId, "user")).thenReturn(Optional.empty());
         
         // Act & Assert
         assertThrows(WorkflowNotFoundException.class,
                 () -> service.startExecution(workflowId, "user", new HashMap<>()));
         
-        verify(workflowRepository).findById(workflowId);
+        verify(workflowRepository).findByIdAndOwnerId(workflowId, "user");
         verify(executionRepository, never()).save(any());
         verify(eventPublisher, never()).publishWorkflowCreated(any());
     }
@@ -213,7 +221,7 @@ class WorkflowExecutionServiceTest {
         WorkflowExecution execution = WorkflowExecution.builder()
                 .id(executionId)
                 .workflowId("wf-123")
-                .status(ExecutionStatus.RUNNING)
+                .status(ExecutionStatus.PENDING)
                 .build();
         execution.start(); // Set startedAt
         
@@ -245,7 +253,7 @@ class WorkflowExecutionServiceTest {
         WorkflowExecution execution = WorkflowExecution.builder()
                 .id(executionId)
                 .workflowId("wf-123")
-                .status(ExecutionStatus.RUNNING)
+                .status(ExecutionStatus.PENDING)
                 .build();
         execution.start();
         
@@ -302,6 +310,7 @@ class WorkflowExecutionServiceTest {
                 .id(executionId)
                 .workflowId("wf-123")
                 .status(ExecutionStatus.RUNNING)
+                .ownerId("owner-123")
                 .build();
         
         TaskExecution task1 = createTaskExecution("task-1", executionId, ExecutionStatus.COMPLETED, List.of());
@@ -313,7 +322,7 @@ class WorkflowExecutionServiceTest {
                 .thenReturn(List.of(task1, task2, task3));
         
         // Act
-        service.cancelExecution(executionId);
+        service.cancelExecution(executionId, "owner-123");
         
         // Assert
         verify(executionRepository).save(argThat(exec -> exec.getStatus() == ExecutionStatus.CANCELLED));
@@ -326,10 +335,48 @@ class WorkflowExecutionServiceTest {
     }
     
     @Test
+    void testCancelExecution_AlreadyFinished() {
+        String executionId = "exec-123";
+        WorkflowExecution execution = WorkflowExecution.builder()
+                .id(executionId)
+                .workflowId("wf-123")
+                .status(ExecutionStatus.COMPLETED)
+                .ownerId("owner-123")
+                .build();
+        when(executionRepository.findById(executionId)).thenReturn(Optional.of(execution));
+        
+        assertThrows(InvalidExecutionStateException.class,
+                () -> service.cancelExecution(executionId, "owner-123"));
+        verify(executionRepository, never()).save(any());
+    }
+    
+    @Test
+    void testGetExecution_OtherUsersExecutionIsNotFound() {
+        String executionId = "exec-123";
+        WorkflowExecution execution = WorkflowExecution.builder()
+                .id(executionId)
+                .workflowId("wf-123")
+                .ownerId("owner-123")
+                .build();
+        when(executionRepository.findById(executionId)).thenReturn(Optional.of(execution));
+        
+        assertThrows(ExecutionNotFoundException.class,
+                () -> service.getExecution(executionId, "someone-else"));
+        assertThrows(ExecutionNotFoundException.class,
+                () -> service.getTaskExecutions(executionId, "someone-else"));
+        verify(taskExecutionRepository, never()).findByExecutionId(anyString());
+    }
+    
+    @Test
     void testGetExecutionStatistics() {
         // Arrange
         String executionId = "exec-123";
-        
+        when(executionRepository.findById(executionId)).thenReturn(Optional.of(WorkflowExecution.builder()
+                .id(executionId)
+                .workflowId("wf-123")
+                .ownerId("owner-123")
+                .build()));
+
         when(taskExecutionRepository.countByExecutionId(executionId)).thenReturn(10L);
         when(taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.PENDING)).thenReturn(2L);
         when(taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.RUNNING)).thenReturn(3L);
@@ -338,7 +385,7 @@ class WorkflowExecutionServiceTest {
         when(taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.CANCELLED)).thenReturn(0L);
         
         // Act
-        WorkflowExecutionService.ExecutionStatistics stats = service.getExecutionStatistics(executionId);
+        WorkflowExecutionService.ExecutionStatistics stats = service.getExecutionStatistics(executionId, "owner-123");
         
         // Assert
         assertEquals(10L, stats.getTotalTasks());

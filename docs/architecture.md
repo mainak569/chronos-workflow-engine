@@ -1,5 +1,11 @@
 # Chronos Architecture
 
+> This is the system design document. Code snippets marked as pseudocode illustrate the design;
+> class and field names in the implementation may differ. Redis keys, topics, retry behaviour,
+> the REST API and metrics below describe the implemented system. For the exact API contract see
+> [api/workflow-api.md](api/workflow-api.md); for failure handling see
+> [failure-recovery-guarantees.md](failure-recovery-guarantees.md).
+
 ## 1. Final System Architecture
 
 ### 1.1 Overview
@@ -61,7 +67,7 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
 2. **Event-Driven Core**: Kafka as the backbone for asynchronous communication
 3. **Durable State in MongoDB**: Single source of truth for workflow execution state
 4. **Ephemeral State in Redis**: Distributed coordination, locks, and heartbeats
-5. **Horizontal Worker Scaling**: The only service designed for multi-instance deployment
+5. **Horizontal Scaling**: Workers scale out freely; schedulers run as several instances with one elected leader
 6. **No Over-Engineering**: Every component must solve a real distributed-system problem
 
 ---
@@ -111,14 +117,11 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
 - Worker health monitoring
 
 **Data Ownership**:
-- `workflows` collection
-- `executions` collection
+- `users`, `workflows` collections
+- `workflow_executions` and `task_executions` (created here; progress written by the scheduler)
 
 **Kafka Interaction**:
-- **Producer**: `workflow-events` topic
-  - `WorkflowStarted`
-  - `WorkflowCompleted`
-  - `WorkflowFailed`
+- **Producer**: `chronos.workflow.created` (one event per started execution)
 
 ---
 
@@ -132,8 +135,8 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
   - `TaskCompleted` → identify newly satisfied dependencies
 - Compute task dependencies
 - Determine which tasks are in PENDING state with satisfied dependencies
-- Transition tasks from PENDING → READY
-- Publish `TaskReady` events to Kafka
+- Claim each task attempt for dispatch and publish `TaskReady` events through the outbox
+- Own retries (backoff) and recovery from lost workers and lost events
 - Coordinate across multiple scheduler instances using Redis leader election
 - Handle scheduler restart gracefully (recover in-progress workflows)
 
@@ -143,18 +146,16 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
 - Creating new workflows
 
 **Data Access**:
-- Reads from `tasks` collection
-- Updates task status (PENDING → READY)
+- Reads and updates `workflow_executions` and `task_executions`
+- Owns `outbox_messages` and `scheduler_state`; reads `workflows` for cron runs
 
 **Kafka Interaction**:
-- **Consumer**: `workflow-events`, `task-events`
-- **Producer**: `task-events` topic
-  - `TaskReady`
+- **Consumer**: `chronos.workflow.created`, `chronos.task.started/completed/failed`, `chronos.worker.*`
+- **Producer**: `chronos.task.ready` (through the transactional outbox)
 
 **Coordination**:
-- Uses Redis for leader election
-- Only the leader actively schedules tasks
-- Lock key: `scheduler:leader:lock` with TTL and renewal
+- Uses Redis for leader election (`chronos:scheduler:leader`, TTL 30s, renewed every 10s)
+- Every instance consumes events; only the leader runs retries, recovery sweeps, cron and the outbox publisher
 
 ---
 
@@ -181,16 +182,13 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
 - Workflow creation
 
 **Data Access**:
-- Updates `tasks` collection
-- Updates `workers` collection
+- No MongoDB writes: results are reported through Kafka and applied by the scheduler
+- Redis: worker registry and heartbeats, task locks and leases, processed-event markers
 
 **Kafka Interaction**:
-- **Consumer**: `task-events` topic (consumer group: `worker-group`)
-  - `TaskReady`
-- **Producer**: `task-events` topic
-  - `TaskStarted`
-  - `TaskCompleted`
-  - `TaskFailed`
+- **Consumer**: `chronos.task.ready` (consumer group: `worker-group`)
+- **Producer**: `chronos.task.started`, `chronos.task.completed`, `chronos.task.failed`,
+  `chronos.task.failed.permanently`, `chronos.worker.registered`, `chronos.worker.unavailable`
 
 **Coordination**:
 - Uses Redis for:
@@ -223,338 +221,74 @@ Chronos is a distributed workflow orchestration engine built with a minimalist s
 
 ## 4. MongoDB Collections and Indexes
 
-### 4.1 Users Collection
+Indexes are created by the services at startup (`spring.data.mongodb.auto-index-creation`) from the
+annotations on the domain classes.
+
+| Collection | Written by | Content | Indexes |
+|---|---|---|---|
+| `users` | workflow | email, username, BCrypt password hash, enabled, last login | `email` (unique) |
+| `workflows` | workflow | owner, name, description, task definitions, optional cron `schedule`/`timezone` | `ownerId`, `createdAt` |
+| `workflow_executions` | workflow, scheduler | workflow, owner, `triggeredBy`, status, input/output, error, timestamps, duration, `version` | `workflowId`, `ownerId`, `triggeredBy`, `status`, `createdAt`, (`workflowId`, `status`) |
+| `task_executions` | workflow, scheduler | one document per task per execution (see below) | (`executionId`, `taskId`) unique, (`executionId`, `status`), `executionId`, `workflowId`, `status`, `createdAt`, (`status`, `nextRetryAt`), (`status`, `dispatchedAt`), (`status`, `workerId`) |
+| `scheduler_state` | scheduler | cron schedule per workflow, next/last run, run count, `version` | `workflowId` (unique), (`enabled`, `nextScheduledTime`), (`workflowId`, `enabled`) |
+| `outbox_messages` | scheduler | TaskReady events waiting for / published to Kafka | `topic`, `status`, `createdAt` |
+
+Worker registry data (status, heartbeats) lives in Redis, not MongoDB (see section 6).
+
+### 4.1 Task Execution Document
+
+Task definitions live in `workflows.tasks`; `task_executions` holds one instance per execution:
 
 ```javascript
 {
-  _id: ObjectId("..."),
-  email: "user@example.com",
-  name: "John Doe",
-  passwordHash: "$2a$10$...",  // BCrypt
-  createdAt: ISODate("2026-01-01T10:00:00Z"),
-  updatedAt: ISODate("2026-01-01T10:00:00Z")
-}
-```
-
-**Indexes**:
-```javascript
-db.users.createIndex({ email: 1 }, { unique: true })
-```
-
-**Rationale**: Email is the primary lookup key for authentication.
-
----
-
-### 4.2 Workflows Collection
-
-```javascript
-{
-  _id: "workflow-123",
-  ownerId: "user-456",
-  name: "image-processing-pipeline",
-  description: "Resize, compress, and upload images",
-  tasks: [
-    {
-      taskId: "resize-image",
-      taskType: "IMAGE_RESIZE",
-      dependencies: [],
-      configuration: { width: 1280, height: 720 },
-      retryConfig: {
-        maxAttempts: 3,
-        initialDelayMs: 5000,
-        backoffMultiplier: 2.0,
-        maxDelayMs: 60000
-      },
-      timeoutMs: 300000
-    },
-    {
-      taskId: "compress-image",
-      taskType: "IMAGE_COMPRESS",
-      dependencies: ["resize-image"],
-      configuration: { quality: 85 },
-      retryConfig: { maxAttempts: 3, initialDelayMs: 5000, backoffMultiplier: 2.0, maxDelayMs: 60000 },
-      timeoutMs: 300000
-    }
-  ],
-  createdAt: ISODate("2026-01-01T10:00:00Z"),
-  updatedAt: ISODate("2026-01-01T10:00:00Z")
-}
-```
-
-**Indexes**:
-```javascript
-db.workflows.createIndex({ ownerId: 1 })
-db.workflows.createIndex({ name: 1, ownerId: 1 })
-db.workflows.createIndex({ createdAt: -1 })
-```
-
-**Rationale**:
-- `ownerId`: Fetch all workflows for a user
-- `name + ownerId`: Lookup workflow by name for a user
-- `createdAt`: List recent workflows
-
----
-
-### 4.3 Executions Collection
-
-```javascript
-{
-  _id: "execution-789",
-  workflowId: "workflow-123",
-  ownerId: "user-456",
-  status: "RUNNING",  // CREATED, RUNNING, COMPLETED, FAILED
-  startedAt: ISODate("2026-01-01T10:00:00Z"),
-  completedAt: null,
-  failedAt: null,
-  correlationId: "req-abc-123",
-  metadata: {}
-}
-```
-
-**Indexes**:
-```javascript
-db.executions.createIndex({ workflowId: 1 })
-db.executions.createIndex({ ownerId: 1, createdAt: -1 })
-db.executions.createIndex({ status: 1 })
-db.executions.createIndex({ correlationId: 1 })
-```
-
-**Rationale**:
-- `workflowId`: Find all executions of a workflow
-- `ownerId + createdAt`: List user's recent executions
-- `status`: Find all in-progress executions (for recovery)
-- `correlationId`: Trace requests across services
-
----
-
-### 4.4 Tasks Collection
-
-**Note**: This collection stores **task execution instances**, not task definitions. Task definitions live in the `workflows.tasks` array.
-
-```javascript
-{
-  _id: "task-execution-001",
-  workflowId: "workflow-123",
-  executionId: "execution-789",
-  taskId: "resize-image",  // References workflows.tasks[].taskId
+  _id: ObjectId("6aacf2321a704a0127be73bf"),
+  executionId: "6aacf2321a704a0127be73be",
+  workflowId: "6aacf2321a704a0127be73bc",
+  taskId: "resize",                    // unique within the execution
+  taskName: "Resize image",
   taskType: "IMAGE_RESIZE",
-  status: "RUNNING",  // PENDING, READY, RUNNING, SUCCESS, FAILED, RETRYING, DEAD
-  workerId: "worker-01",
-  attempt: 1,
-  maxAttempts: 3,
-  
-  claimedAt: ISODate("2026-01-01T10:00:10Z"),
-  startedAt: ISODate("2026-01-01T10:00:11Z"),
-  completedAt: null,
-  
-  nextRetryAt: null,
-  lastError: null,
-  
+  status: "COMPLETED",                 // PENDING, RUNNING, COMPLETED, FAILED, CANCELLED
+  dependsOn: [],
   configuration: { width: 1280, height: 720 },
-  result: null,
-  
-  dependencies: [],
-  dependenciesMet: true
+  output: { status: "success", attempt: 1, processedBy: "worker-7f55a92b7d6f" },
+  errorMessage: null, errorType: null,
+  workerId: "worker-7f55a92b7d6f",
+  attemptNumber: 1, maxRetries: 3, retriable: true,
+  retryInitialDelayMs: 5000, retryBackoffMultiplier: 2.0, retryMaxDelayMs: 300000,
+  timeoutMs: 300000,
+  dispatchedAt: ISODate("..."),        // set when the current attempt was dispatched
+  nextRetryAt: null,                   // earliest time of the next attempt after a failure
+  lastAttemptAt: null,
+  startedAt: ISODate("..."), completedAt: ISODate("..."), durationMs: 1009,
+  createdAt: ISODate("..."), updatedAt: ISODate("..."),
+  version: 3                           // optimistic locking
 }
 ```
 
-**Indexes**:
-```javascript
-db.tasks.createIndex({ executionId: 1 })
-db.tasks.createIndex({ executionId: 1, taskId: 1 }, { unique: true })
-db.tasks.createIndex({ status: 1 })
-db.tasks.createIndex({ workerId: 1 })
-db.tasks.createIndex({ nextRetryAt: 1 }, { sparse: true })
-db.tasks.createIndex({ status: 1, dependenciesMet: 1 })
-```
-
-**Rationale**:
-- `executionId`: Fetch all tasks for an execution
-- `executionId + taskId`: Unique task instance per execution
-- `status`: Find tasks in specific states (PENDING, READY, etc.)
-- `workerId`: Find tasks owned by a worker (for failure recovery)
-- `nextRetryAt`: Scheduler can poll for tasks ready to retry
-- `status + dependenciesMet`: Efficiently find PENDING tasks with satisfied dependencies
-
----
-
-### 4.5 Workers Collection
-
-```javascript
-{
-  _id: "worker-01",
-  status: "AVAILABLE",  // AVAILABLE, BUSY, UNAVAILABLE
-  supportedTaskTypes: ["IMAGE_RESIZE", "IMAGE_COMPRESS", "DATA_PROCESSING"],
-  registeredAt: ISODate("2026-01-01T09:00:00Z"),
-  lastHeartbeatAt: ISODate("2026-01-01T10:00:00Z"),
-  metadata: {
-    hostname: "worker-pod-1",
-    version: "1.0.0"
-  }
-}
-```
-
-**Indexes**:
-```javascript
-db.workers.createIndex({ status: 1 })
-db.workers.createIndex({ lastHeartbeatAt: -1 })
-```
-
-**Rationale**:
-- `status`: Find available workers
-- `lastHeartbeatAt`: Detect stale workers (though Redis is primary heartbeat mechanism)
+Both services use `@Version` on executions and tasks, so concurrent updates (e.g. a cancel racing a task
+completion) fail with a conflict and are retried instead of overwriting each other.
 
 ---
 
 ## 5. Kafka Topics, Partitions, Keys, Producers and Consumers
 
-### 5.1 Topic: `workflow-events`
+One topic per event type (details, schemas and consumer groups in
+[kafka-event-architecture.md](kafka-event-architecture.md)):
 
-**Purpose**: Workflow lifecycle events
+| Topic | Producer | Consumer (group) | Key |
+|---|---|---|---|
+| `chronos.workflow.created` | workflow service | scheduler (`scheduler-group`) | executionId |
+| `chronos.task.ready` | scheduler (via outbox) | workers (`worker-group`) | executionId |
+| `chronos.task.started` | worker | scheduler | executionId |
+| `chronos.task.completed` | worker | scheduler | executionId |
+| `chronos.task.failed` | worker | scheduler | executionId |
+| `chronos.task.failed.permanently` | worker | — (dead letter queue for operators) | executionId |
+| `chronos.worker.registered` | worker | scheduler | workerId |
+| `chronos.worker.unavailable` | worker | scheduler | workerId |
+| `<topic>.dlt` | consumers' error handler | — | original key |
 
-**Partitions**: 3
-
-**Message Key**: `workflowId`
-
-**Rationale**: All events for the same workflow go to the same partition, preserving order for that workflow.
-
-**Events**:
-- `WorkflowStarted`
-- `WorkflowCompleted`
-- `WorkflowFailed`
-
-**Producers**:
-- Workflow Service
-
-**Consumers**:
-- Scheduler Service (consumer group: `scheduler-group`)
-
-**Event Schema**:
-```json
-{
-  "eventId": "evt-001",
-  "eventType": "WorkflowStarted",
-  "workflowId": "workflow-123",
-  "executionId": "execution-789",
-  "timestamp": "2026-01-01T10:00:00Z",
-  "correlationId": "req-abc-123",
-  "payload": {
-    "ownerId": "user-456",
-    "tasks": [...]
-  }
-}
-```
-
----
-
-### 5.2 Topic: `task-events`
-
-**Purpose**: Task lifecycle events
-
-**Partitions**: 6
-
-**Message Key**: `executionId`
-
-**Rationale**: All tasks within the same execution go to the same partition. This ensures ordered processing of tasks within a workflow execution while allowing different executions to be processed in parallel.
-
-**Alternative Considered**: Key by `taskId` → Problem: tasks from different executions would be interleaved, making dependency tracking harder.
-
-**Events**:
-- `TaskReady`
-- `TaskStarted`
-- `TaskCompleted`
-- `TaskFailed`
-
-**Producers**:
-- Scheduler Service: `TaskReady`
-- Worker Service: `TaskStarted`, `TaskCompleted`, `TaskFailed`
-
-**Consumers**:
-- Scheduler Service (consumer group: `scheduler-group`): consumes `TaskCompleted`, `TaskFailed` to determine next ready tasks
-- Worker Service (consumer group: `worker-group`): consumes `TaskReady` to claim and execute tasks
-
-**Event Schema**:
-```json
-{
-  "eventId": "evt-002",
-  "eventType": "TaskReady",
-  "workflowId": "workflow-123",
-  "executionId": "execution-789",
-  "taskId": "resize-image",
-  "taskType": "IMAGE_RESIZE",
-  "timestamp": "2026-01-01T10:00:05Z",
-  "correlationId": "req-abc-123",
-  "payload": {
-    "configuration": { "width": 1280, "height": 720 },
-    "attempt": 1,
-    "maxAttempts": 3
-  }
-}
-```
-
----
-
-### 5.3 Topic: `worker-events`
-
-**Purpose**: Worker lifecycle and health events
-
-**Partitions**: 1
-
-**Message Key**: `workerId`
-
-**Events**:
-- `WorkerRegistered`
-- `WorkerDeregistered`
-- `WorkerHeartbeat` (optional, mainly handled by Redis)
-
-**Producers**:
-- Worker Service
-
-**Consumers**:
-- None initially (future: monitoring service)
-
-**Rationale**: Low volume, informational. Primarily for observability.
-
----
-
-### 5.4 Topic: `dead-letter-queue`
-
-**Purpose**: Tasks that exceeded retry limits
-
-**Partitions**: 1
-
-**Message Key**: `taskId`
-
-**Events**:
-- `TaskDead`
-
-**Producers**:
-- Worker Service (after final retry failure)
-
-**Consumers**:
-- None initially (future: alerting service, manual intervention UI)
-
-**Event Schema**:
-```json
-{
-  "eventId": "evt-dlq-001",
-  "eventType": "TaskDead",
-  "workflowId": "workflow-123",
-  "executionId": "execution-789",
-  "taskId": "resize-image",
-  "taskType": "IMAGE_RESIZE",
-  "timestamp": "2026-01-01T10:10:00Z",
-  "correlationId": "req-abc-123",
-  "payload": {
-    "attempts": 3,
-    "lastError": "OutOfMemoryError: Java heap space",
-    "workerId": "worker-02",
-    "failedAt": "2026-01-01T10:09:55Z"
-  }
-}
-```
-
----
+Events are JSON without type headers; each consumer deserializes into its own event class, so the
+services share no code. Consumers acknowledge manually after processing (at-least-once) and are idempotent.
 
 ### 5.5 Kafka Ordering Guarantees
 
@@ -579,16 +313,16 @@ db.workers.createIndex({ lastHeartbeatAt: -1 })
 
 **Purpose**: Prevent multiple workers from executing the same task
 
-**Key Pattern**: `task:{executionId}:{taskId}:lock`
+**Key Pattern**: `chronos:lock:task:{executionId}:{taskId}`
 
-**Data Type**: String (stores worker ID)
+**Data Type**: String (stores a lock token `{workerId}:{uuid}`)
 
-**TTL**: 5 minutes (300 seconds)
+**TTL**: 5 minutes (300 seconds), extended while the task runs
 
 **Operations**:
 ```java
 // Acquire lock
-SET task:execution-789:resize-image:lock worker-01 NX EX 300
+SET chronos:lock:task:execution-789:resize-image worker-01:3f2c... NX PX 300000
 
 // Release lock (only if owned)
 Lua script:
@@ -608,7 +342,7 @@ Lua script:
 
 ### 6.2 Worker Heartbeats
 
-**Key Pattern**: `worker:{workerId}:heartbeat`
+**Key Pattern**: `worker:heartbeat:{workerId}`
 
 **Data Type**: String (stores timestamp)
 
@@ -616,14 +350,15 @@ Lua script:
 
 **Operations**:
 ```java
-// Update heartbeat
-SETEX worker:worker-01:heartbeat 30 "2026-01-01T10:00:00Z"
+// Update heartbeat (every 10 seconds)
+SET worker:heartbeat:worker-01 "2026-01-01T10:00:00Z" EX 30
 
 // Check if worker is alive
-EXISTS worker:worker-01:heartbeat
+EXISTS worker:heartbeat:worker-01
 ```
 
-**Background Job**: Scheduler service polls for expired workers every 15 seconds
+**Background Job**: The leader scheduler checks for expired heartbeats every 15 seconds; tasks RUNNING
+on a dead worker are requeued, its task locks released and the tasks dispatched again.
 
 **Rationale**:
 - 30s TTL means worker must heartbeat every ~10s
@@ -633,64 +368,57 @@ EXISTS worker:worker-01:heartbeat
 
 ### 6.3 Worker Metadata
 
-**Key Pattern**: `worker:{workerId}:metadata`
+**Key Pattern**: `worker:metadata:{workerId}` (plus index sets `worker:index:status:{STATUS}` and
+`worker:index:taskType:{TYPE}`)
 
-**Data Type**: Hash
+**Data Type**: String (JSON document)
 
-**TTL**: None (persistent until worker deregisters)
+**TTL**: None (kept until the worker deregisters; marked `STOPPED` on graceful shutdown)
 
-**Fields**:
+**Example value**:
+```json
+{"workerId": "worker-01", "status": "AVAILABLE",
+ "supportedTaskTypes": ["IMAGE_RESIZE", "IMAGE_COMPRESS"], "lastHeartbeat": "2026-01-01T09:00:00Z"}
 ```
-supportedTaskTypes: "IMAGE_RESIZE,IMAGE_COMPRESS"
-status: "AVAILABLE"
-registeredAt: "2026-01-01T09:00:00Z"
-```
 
-**Operations**:
-```java
-HSET worker:worker-01:metadata supportedTaskTypes "IMAGE_RESIZE,IMAGE_COMPRESS"
-HGET worker:worker-01:metadata status
-```
+A worker runs several tasks concurrently; it is `BUSY` while at least one task is in flight.
 
 ---
 
 ### 6.4 Scheduler Leader Lock
 
-**Key Pattern**: `scheduler:leader:lock`
+**Key Pattern**: `chronos:scheduler:leader`
 
-**Data Type**: String (stores scheduler instance ID)
+**Data Type**: String (stores `{schedulerId}:{timestamp}`)
 
-**TTL**: 10 seconds
+**TTL**: 30 seconds
 
 **Operations**:
 ```java
 // Acquire leadership
-SET scheduler:leader:lock scheduler-01 NX EX 10
+SET chronos:scheduler:leader scheduler-01:2026-01-01T10:00:00Z NX PX 30000
 
-// Renew leadership (every 5 seconds if still leader)
-SET scheduler:leader:lock scheduler-01 XX EX 10
+// Renew leadership every 10 seconds (Lua: only if the value still starts with our ID)
+EVAL renew_leadership.lua 1 chronos:scheduler:leader scheduler-01 <new value> 30000
+
+// Release on shutdown (Lua compare-and-delete)
+EVAL release_leadership.lua 1 chronos:scheduler:leader scheduler-01
 ```
 
 **Rationale**:
-- Short TTL ensures fast failover (max 10s delay)
-- Leader must renew every 5s
-- If leader crashes, another instance can acquire leadership within 10s
+- Only the leader dispatches retries, runs recovery sweeps, cron schedules and the outbox publisher
+- If the leader crashes, another instance takes over within the 30s TTL
+- A graceful shutdown releases leadership immediately
 
 ---
 
-### 6.5 Rate Limiting (Optional)
+### 6.5 Rate Limiting
 
-**Key Pattern**: `ratelimit:user:{userId}:{endpoint}:{window}`
-
-**Data Type**: String (counter)
-
-**TTL**: 60 seconds
-
-**Operations**:
-```java
-INCR ratelimit:user:user-123:/api/workflows:2026-01-01-10:00
-EXPIRE ratelimit:user:user-123:/api/workflows:2026-01-01-10:00 60
-```
+Rate limiting is done by the API gateway **in memory** (per gateway instance), not in Redis:
+a fixed one-minute window per authenticated user, or per client IP for anonymous calls
+(default 120 requests/minute, `GATEWAY_RATE_LIMIT_PER_MINUTE`). Exceeding it returns
+`429 Too Many Requests` with a `Retry-After` header. With several gateway instances the
+effective limit is multiplied; a Redis-backed counter would be the next step.
 
 ---
 
@@ -711,61 +439,48 @@ EXPIRE ratelimit:user:user-123:/api/workflows:2026-01-01-10:00 60
 ### 7.1 Execution Lifecycle
 
 ```
-Client Request
-      |
-      v
-POST /api/v1/workflows/{id}/execute
-      |
-      v
-API Gateway (authenticate)
+Client: POST /api/v1/workflows/{id}/execute
       |
       v
 Workflow Service
       |
-      +---> Validate workflow exists
-      +---> Create execution record (status: CREATED)
-      +---> Create task execution instances (status: PENDING)
-      +---> Update execution status: RUNNING
-      +---> Publish WorkflowStarted event
+      +---> Check the workflow exists and belongs to the caller
+      +---> Create execution (status: PENDING) and task executions (status: PENDING)
+      +---> Publish WorkflowCreated
       |
       v
-   Kafka: workflow-events
+   Kafka: chronos.workflow.created
       |
       v
-Scheduler Service (listens to WorkflowStarted)
+Scheduler Service
       |
-      +---> Find tasks with no dependencies
-      +---> Update task status: READY
-      +---> Publish TaskReady events
-      |
-      v
-   Kafka: task-events
+      +---> Find PENDING tasks whose dependencies are COMPLETED
+      +---> Claim each attempt atomically (set dispatchedAt) and write TaskReady to the outbox
+      +---> Leader publishes the outbox
       |
       v
-Worker Service (listens to TaskReady)
+   Kafka: chronos.task.ready
       |
-      +---> Attempt to acquire lock
-      +---> If success: claim task
-      +---> Execute task
+      v
+Worker Service
+      |
+      +---> Acquire lock on {executionId}:{taskId}
+      +---> Publish TaskStarted, execute under timeoutMs
       +---> Publish TaskCompleted or TaskFailed
       |
       v
-   Kafka: task-events
+   Kafka: chronos.task.started / completed / failed
       |
       v
-Scheduler Service (listens to TaskCompleted)
+Scheduler Service
       |
-      +---> Find dependent tasks
-      +---> Check if dependencies satisfied
-      +---> If yes: update status to READY, publish TaskReady
-      |
-      v
-Repeat until all tasks complete
+      +---> Update the task (idempotent, ignores old attempts)
+      +---> Failure with attempts left: back to PENDING with nextRetryAt (retry sweep dispatches it)
+      +---> Update execution: RUNNING, then COMPLETED (all tasks done) or FAILED
+      +---> Dispatch tasks whose dependencies are now complete
       |
       v
-Workflow Service
-      |
-      +---> Update execution status: COMPLETED or FAILED
+Repeat until the execution is COMPLETED, FAILED or CANCELLED
 ```
 
 ### 7.2 Task Dependency Resolution
@@ -780,34 +495,22 @@ Example workflow:
 ```
 
 **Execution Flow**:
-1. Workflow starts → Task A is READY (no dependencies)
-2. Task A completes → Tasks B and C become READY (dependency satisfied)
-3. Tasks B and C execute in parallel
-4. Both B and C complete → Task D becomes READY (all dependencies satisfied)
-5. Task D completes → Workflow completes
+1. Execution starts → Task A is dispatched (no dependencies)
+2. Task A completes → Tasks B and C are dispatched (dependency satisfied)
+3. Tasks B and C execute in parallel on any workers
+4. Both B and C complete → Task D is dispatched (all dependencies satisfied)
+5. Task D completes → Execution completes; its output aggregates every task's output
 
-**Implementation**:
+**Implementation** (`ExecutionOrchestrationService.getReadyTasks` and `TaskDispatchService`):
 ```java
-// Pseudo-code in Scheduler
-@KafkaListener(topics = "task-events")
-void handleTaskCompleted(TaskCompletedEvent event) {
-    // Find tasks that depend on this task
-    List<Task> dependentTasks = taskRepository.findByExecutionIdAndDependenciesContaining(
-        event.getExecutionId(),
-        event.getTaskId()
-    );
-    
-    for (Task task : dependentTasks) {
-        // Check if ALL dependencies are satisfied
-        boolean allDependenciesMet = checkAllDependenciesMet(task);
-        
-        if (allDependenciesMet && task.getStatus() == TaskStatus.PENDING) {
-            task.setStatus(TaskStatus.READY);
-            task.setDependenciesMet(true);
-            taskRepository.save(task);
-            
-            kafkaProducer.send("task-events", TaskReadyEvent.from(task));
-        }
+List<TaskExecution> allTasks = taskExecutionRepository.findByExecutionId(executionId);
+Map<String, TaskExecution> byTaskId = allTasks.stream()
+        .collect(Collectors.toMap(TaskExecution::getTaskId, t -> t));
+
+for (TaskExecution task : allTasks) {
+    // PENDING, not yet dispatched for this attempt, past nextRetryAt, all dependencies COMPLETED
+    if (task.isDispatchable(byTaskId, Instant.now()) && claimForDispatch(task)) {
+        outboxService.createMessage("chronos.task.ready", executionId, TaskReadyEvent.from(task), ...);
     }
 }
 ```
@@ -817,69 +520,44 @@ void handleTaskCompleted(TaskCompletedEvent event) {
 ## 8. Task State Machine
 
 ```
-         ┌─────────────┐
-         │   PENDING   │ (created, waiting for dependencies)
-         └──────┬──────┘
-                │
-                │ (dependencies satisfied)
-                v
-         ┌─────────────┐
-         │    READY    │ (ready to be claimed)
-         └──────┬──────┘
-                │
-                │ (worker claims task)
-                v
-         ┌─────────────┐
-         │   RUNNING   │
-         └──────┬──────┘
-                │
-        ┌───────┴───────┐
-        │               │
-        v               v
-  ┌──────────┐    ┌──────────┐
-  │ SUCCESS  │    │  FAILED  │
-  └──────────┘    └─────┬────┘
-                        │
-                        │ (attempt < maxAttempts)
-                        v
-                  ┌──────────┐
-                  │RETRYING  │
-                  └─────┬────┘
-                        │
-                        │ (after backoff delay)
-                        v
-                  ┌──────────┐
-                  │  READY   │ (back to ready, attempt++)
-                  └──────────┘
-                        
-                  (attempt >= maxAttempts)
-                        │
-                        v
-                  ┌──────────┐
-                  │   DEAD   │ (moved to DLQ)
-                  └──────────┘
+                  ┌────────────────────────────────────────────┐
+                  │ retriable failure, attempts left:            │
+                  │ attempt+1, nextRetryAt = now + backoff       │
+                  ▼                                              │
+  ┌──────────┐ dispatched ┌──────────┐  success  ┌───────────┐   │
+  │ PENDING  │───────────▶│ RUNNING  │──────────▶│ COMPLETED │   │
+  └──────────┘ (worker    └────┬─────┘           └───────────┘   │
+       │        started)       │ failure                         │
+       │                       ├─────────────────────────────────┘
+       │                       │ non-retriable, or no attempts left
+       │                       ▼
+       │                 ┌──────────┐   (worker publishes TaskFailedPermanently
+       │                 │  FAILED  │    to chronos.task.failed.permanently)
+       │                 └──────────┘
+       │  execution cancelled / failed
+       ▼
+  ┌───────────┐
+  │ CANCELLED │
+  └───────────┘
+
+  RUNNING ──worker lost (heartbeat expired)──▶ PENDING (same attempt, re-dispatched)
 ```
 
-### Valid State Transitions
+"Ready" and "waiting for retry" are not separate statuses: a `PENDING` task is dispatchable when all
+dependencies are `COMPLETED`, `dispatchedAt` is null for its current attempt and `nextRetryAt` (if set)
+has passed.
 
-| From | To | Condition |
+| From | To | Trigger |
 |---|---|---|
-| PENDING | READY | Dependencies satisfied |
-| READY | RUNNING | Worker claimed task |
-| RUNNING | SUCCESS | Task completed successfully |
-| RUNNING | FAILED | Task failed |
-| FAILED | RETRYING | attempt < maxAttempts |
-| RETRYING | READY | After backoff delay |
-| FAILED | DEAD | attempt >= maxAttempts |
+| PENDING | RUNNING | `TaskStarted` (or a completion/failure arriving first) |
+| RUNNING | COMPLETED | `TaskCompleted` for the current attempt |
+| RUNNING | PENDING | retriable failure with attempts left; or worker lost (requeue) |
+| RUNNING | FAILED | non-retriable failure or attempts exhausted |
+| PENDING / RUNNING | CANCELLED | execution cancelled, or another task failed permanently |
 
-### Invalid Transitions (Must be Rejected)
-
-- PENDING → RUNNING (must go through READY)
-- SUCCESS → FAILED (cannot fail after success)
-- DEAD → RETRYING (dead is terminal)
-- RUNNING → PENDING (cannot go backwards)
-
-**Implementation**: Use state machine pattern with validation in domain layer.
+Terminal states (`COMPLETED`, `FAILED`, `CANCELLED`) never change; late or duplicate events for them,
+and events for older attempts, are ignored. Validation lives in `ExecutionStatus` and the `TaskExecution`
+domain methods.
 
 ---
 
@@ -913,7 +591,7 @@ public class WorkerLifecycleManager {
         startHeartbeat(workerId);
         
         // 4. Publish WorkerRegistered event
-        kafkaProducer.send("worker-events", new WorkerRegisteredEvent(workerId));
+        kafkaProducer.send("chronos.worker.registered", new WorkerRegisteredEvent(workerId));
         
         log.info("Worker {} registered successfully", workerId);
     }
@@ -967,7 +645,7 @@ public void shutdown() {
     redisTemplate.delete("worker:" + workerId + ":metadata");
     
     // 6. Publish WorkerDeregistered event
-    kafkaProducer.send("worker-events", new WorkerDeregisteredEvent(workerId));
+    kafkaProducer.send("chronos.worker.unavailable", new WorkerUnavailableEvent(workerId));
     
     log.info("Worker {} shut down gracefully", workerId);
 }
@@ -1007,40 +685,26 @@ public void detectFailedWorkers() {
 
 **Detection**:
 1. Worker-01 stops sending heartbeats
-2. After 30 seconds, Redis key `worker:worker-01:heartbeat` expires
+2. After 30 seconds, Redis key `worker:heartbeat:worker-01` expires
 3. Scheduler's background job detects missing heartbeat
 4. Marks worker as UNAVAILABLE
 
-**Recovery**:
+**Recovery** (`WorkerFailureHandler`):
 ```java
-void recoverTasksFromWorker(String workerId) {
-    // Find all tasks claimed by this worker that are still RUNNING
-    List<Task> runningTasks = taskRepository.findByWorkerIdAndStatus(
-        workerId, 
-        TaskStatus.RUNNING
-    );
-    
-    for (Task task : runningTasks) {
-        log.info("Recovering task {} from failed worker {}", task.getId(), workerId);
-        
-        // Check if lock is still held
-        String lockKey = "task:" + task.getExecutionId() + ":" + task.getTaskId() + ":lock";
-        String lockHolder = redisTemplate.opsForValue().get(lockKey);
-        
-        if (workerId.equals(lockHolder)) {
-            // Force release lock
-            redisTemplate.delete(lockKey);
-        }
-        
-        // Reset task to READY status
-        task.setStatus(TaskStatus.READY);
-        task.setWorkerId(null);
-        task.setClaimedAt(null);
-        taskRepository.save(task);
-        
-        // Republish TaskReady event
-        kafkaProducer.send("task-events", TaskReadyEvent.from(task));
+public int handleWorkerLost(String workerId) {
+    // RUNNING tasks of the lost worker go back to PENDING (same attempt, dispatch claim cleared)
+    List<TaskExecution> requeued = orchestrationService.requeueTasksOfWorker(workerId);
+
+    for (TaskExecution task : requeued) {
+        // Release the lock only if the lost worker still holds it (Lua: value starts with "workerId:")
+        String lockKey = "chronos:lock:task:" + task.getExecutionId() + ":" + task.getTaskId();
+        distributedLock.releaseIfOwnedBy(lockKey, workerId + ":");
     }
+
+    // Dispatch the requeued tasks again through the outbox
+    requeued.stream().map(TaskExecution::getExecutionId).distinct()
+            .forEach(taskDispatchService::dispatchReadyTasks);
+    return requeued.size();
 }
 ```
 
@@ -1140,15 +804,14 @@ void handleTaskCompleted(TaskCompletedEvent event) {
     Task task = taskRepository.findById(event.getTaskId())
         .orElseThrow();
     
-    // Idempotent check: only transition from RUNNING to SUCCESS
-    if (task.getStatus() != TaskStatus.RUNNING) {
+    // Idempotent check: terminal tasks and results of older attempts are ignored
+    if (task.getStatus().isTerminal() || event.getAttemptNumber() != task.getAttemptNumber()) {
         log.warn("Ignoring duplicate TaskCompleted event for task {} (current status: {})",
             task.getId(), task.getStatus());
         return;
     }
     
-    task.setStatus(TaskStatus.SUCCESS);
-    task.setCompletedAt(Instant.now());
+    task.complete(event.getResult());   // a PENDING task is implicitly started first
     taskRepository.save(task);
     
     // Continue with dependency resolution...
@@ -1165,7 +828,7 @@ void handleTaskCompleted(TaskCompletedEvent event) {
 
 ```java
 public boolean tryAcquireTaskLock(String executionId, String taskId, String workerId) {
-    String lockKey = "task:" + executionId + ":" + taskId + ":lock";
+    String lockKey = "chronos:lock:task:" + executionId + ":" + taskId;
     
     // SET NX EX: Set if Not eXists with EXpiration
     Boolean acquired = redisTemplate.opsForValue().setIfAbsent(
@@ -1186,7 +849,7 @@ public boolean tryAcquireTaskLock(String executionId, String taskId, String work
 
 ```java
 public void releaseTaskLock(String executionId, String taskId, String workerId) {
-    String lockKey = "task:" + executionId + ":" + taskId + ":lock";
+    String lockKey = "chronos:lock:task:" + executionId + ":" + taskId;
     
     // Lua script ensures atomicity: only release if current worker owns the lock
     String luaScript = 
@@ -1310,241 +973,63 @@ public long calculateNextRetryDelay(int attempt, RetryConfig config) {
 
 ### 12.3 Retry Flow
 
-```java
-@Transactional
-void handleTaskFailed(TaskFailedEvent event) {
-    Task task = taskRepository.findById(event.getTaskId()).orElseThrow();
-    
-    task.setStatus(TaskStatus.FAILED);
-    task.setLastError(event.getError());
-    
-    if (task.getAttempt() < task.getMaxAttempts()) {
-        // Schedule retry
-        task.setStatus(TaskStatus.RETRYING);
-        
-        long delayMs = calculateNextRetryDelay(task.getAttempt() + 1, task.getRetryConfig());
-        Instant nextRetryAt = Instant.now().plusMillis(delayMs);
-        task.setNextRetryAt(nextRetryAt);
-        
-        taskRepository.save(task);
-        
-        log.info("Task {} will retry in {}ms (attempt {}/{})",
-            task.getId(), delayMs, task.getAttempt() + 1, task.getMaxAttempts());
-        
-        // Scheduler will poll for tasks with nextRetryAt <= now
-    } else {
-        // Send to dead-letter queue
-        task.setStatus(TaskStatus.DEAD);
-        taskRepository.save(task);
-        
-        kafkaProducer.send("dead-letter-queue", TaskDeadEvent.from(task, event.getError()));
-        
-        log.error("Task {} exceeded max retries, moved to DLQ", task.getId());
-    }
-}
-```
+Retries are owned by the scheduler (`ExecutionOrchestrationService.markTaskAsFailed`):
+
+1. The worker publishes `TaskFailedEvent` with the attempt number and whether the error is retriable
+   (IO/transient errors are retriable; `IllegalArgumentException`, `NullPointerException`,
+   `SecurityException`, unsupported task types are not). Events for older attempts are ignored.
+2. If the error is retriable and `attemptNumber < maxAttempts`, the task goes back to `PENDING`
+   with `attemptNumber + 1` and `nextRetryAt = now + backoff` (backoff from the task's `retryConfig`).
+3. Otherwise the task becomes `FAILED`, the workflow execution fails, unstarted tasks are cancelled,
+   and the worker publishes `TaskFailedPermanentlyEvent` to `chronos.task.failed.permanently` (DLQ).
+
 
 ### 12.4 Retry Polling (Scheduler)
 
-```java
-@Scheduled(fixedDelay = 5000) // Every 5 seconds
-public void scheduleRetries() {
-    Instant now = Instant.now();
-    
-    List<Task> tasksToRetry = taskRepository.findByStatusAndNextRetryAtBefore(
-        TaskStatus.RETRYING,
-        now
-    );
-    
-    for (Task task : tasksToRetry) {
-        task.setStatus(TaskStatus.READY);
-        task.setAttempt(task.getAttempt() + 1);
-        task.setNextRetryAt(null);
-        taskRepository.save(task);
-        
-        kafkaProducer.send("task-events", TaskReadyEvent.from(task));
-    }
-}
-```
+Implemented by `RestartRecoveryService.dispatchDueRetries()` on the leader every 2 seconds: tasks
+`PENDING` with `nextRetryAt <= now` that are not yet dispatched are claimed atomically and their
+`TaskReady` events written to the outbox.
 
 ---
 
 ## 13. API Design
 
+The full contract, with request/response examples and error codes, is in
+[api/workflow-api.md](api/workflow-api.md); a runnable Postman collection is in
+[`postman/`](../postman/chronos-api.postman_collection.json).
+
+All endpoints are served by the workflow service and reachable through the API gateway at
+`http://localhost:8080/api/v1`. Everything except `/auth/**` requires `Authorization: Bearer <token>`,
+and users only see their own workflows and executions (other users' resources return 404).
+
 ### 13.1 Authentication APIs
 
-**POST /api/v1/auth/register**
-
-Request:
-```json
-{
-  "email": "user@example.com",
-  "name": "John Doe",
-  "password": "SecurePass123!"
-}
-```
-
-Response (201 Created):
-```json
-{
-  "userId": "user-123",
-  "email": "user@example.com",
-  "name": "John Doe",
-  "createdAt": "2026-01-01T10:00:00Z"
-}
-```
-
----
-
-**POST /api/v1/auth/login**
-
-Request:
-```json
-{
-  "email": "user@example.com",
-  "password": "SecurePass123!"
-}
-```
-
-Response (200 OK):
-```json
-{
-  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "tokenType": "Bearer",
-  "expiresIn": 3600
-}
-```
-
----
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/auth/register` | `{"email", "username", "password"}` | `201` `{"token", "userId", "email", "username", "expiresIn"}` |
+| POST | `/auth/login` | `{"email", "password"}` | `200` same shape as register |
 
 ### 13.2 Workflow APIs
 
-**POST /api/v1/workflows**
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/workflows` | `{"name", "description", "tasks": [...], "schedule"?, "timezone"?}` → `201` with `workflowId` |
+| GET | `/workflows` | Caller's workflows |
+| GET | `/workflows/{workflowId}` | `404` if missing or owned by someone else |
+| DELETE | `/workflows/{workflowId}` | `204` |
+| POST | `/workflows/{workflowId}/execute` | Optional `{"input": {...}}` → `201` with `executionId`, status `PENDING` |
 
-Headers:
-```
-Authorization: Bearer <token>
-```
-
-Request:
-```json
-{
-  "name": "image-processing-pipeline",
-  "description": "Resize, compress, and upload images",
-  "tasks": [
-    {
-      "taskId": "resize",
-      "taskType": "IMAGE_RESIZE",
-      "dependencies": [],
-      "configuration": {
-        "width": 1280,
-        "height": 720
-      },
-      "retryConfig": {
-        "maxAttempts": 3,
-        "initialDelayMs": 5000,
-        "backoffMultiplier": 2.0,
-        "maxDelayMs": 60000
-      },
-      "timeoutMs": 300000
-    },
-    {
-      "taskId": "compress",
-      "taskType": "IMAGE_COMPRESS",
-      "dependencies": ["resize"],
-      "configuration": {
-        "quality": 85
-      }
-    }
-  ]
-}
-```
-
-Response (201 Created):
-```json
-{
-  "workflowId": "workflow-123",
-  "name": "image-processing-pipeline",
-  "ownerId": "user-456",
-  "createdAt": "2026-01-01T10:00:00Z"
-}
-```
-
----
-
-**GET /api/v1/workflows/{workflowId}**
-
-Response (200 OK):
-```json
-{
-  "workflowId": "workflow-123",
-  "name": "image-processing-pipeline",
-  "description": "Resize, compress, and upload images",
-  "ownerId": "user-456",
-  "tasks": [...],
-  "createdAt": "2026-01-01T10:00:00Z",
-  "updatedAt": "2026-01-01T10:00:00Z"
-}
-```
-
----
-
-**POST /api/v1/workflows/{workflowId}/execute**
-
-Response (202 Accepted):
-```json
-{
-  "executionId": "execution-789",
-  "workflowId": "workflow-123",
-  "status": "RUNNING",
-  "startedAt": "2026-01-01T10:05:00Z"
-}
-```
-
----
+Workflows are validated on creation (unique task IDs, existing dependencies, no cycles, valid cron).
 
 ### 13.3 Execution APIs
 
-**GET /api/v1/executions/{executionId}**
-
-Response (200 OK):
-```json
-{
-  "executionId": "execution-789",
-  "workflowId": "workflow-123",
-  "status": "RUNNING",
-  "startedAt": "2026-01-01T10:05:00Z",
-  "completedAt": null,
-  "correlationId": "req-abc-123"
-}
-```
-
----
-
-**GET /api/v1/executions/{executionId}/tasks**
-
-Response (200 OK):
-```json
-{
-  "executionId": "execution-789",
-  "tasks": [
-    {
-      "taskId": "resize",
-      "status": "SUCCESS",
-      "attempt": 1,
-      "startedAt": "2026-01-01T10:05:10Z",
-      "completedAt": "2026-01-01T10:05:15Z"
-    },
-    {
-      "taskId": "compress",
-      "status": "RUNNING",
-      "attempt": 1,
-      "startedAt": "2026-01-01T10:05:20Z",
-      "completedAt": null
-    }
-  ]
-}
-```
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/workflows/executions/{executionId}` | Status, input/output, timestamps, error |
+| GET | `/workflows/executions/{executionId}/tasks` | Per-task status, attempt number, worker, output |
+| GET | `/workflows/executions/{executionId}/tasks/{taskId}` | Single task |
+| GET | `/workflows/executions/{executionId}/statistics` | Task counts by status and completion % |
+| POST | `/workflows/executions/{executionId}/cancel` | `409` if already finished |
 
 ---
 
@@ -1651,11 +1136,11 @@ services:
     ports:
       - "8083-8093:8083"  # Support up to 10 workers
     environment:
-      MONGODB_URI: mongodb://chronos:chronos123@mongodb:27017/chronos
+      MONGODB_URI: mongodb://chronos:chronos123@mongodb:27017/chronos?authSource=admin
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       REDIS_HOST: redis
       REDIS_PORT: 6379
-      WORKER_ID: ${HOSTNAME}
+      # no WORKER_ID: each replica uses worker-<container hostname>
     depends_on:
       - mongodb
       - kafka
@@ -1725,7 +1210,7 @@ docker compose up --scale worker-service=5
 @Test
 void shouldRejectInvalidStateTransition() {
     Task task = new Task();
-    task.setStatus(TaskStatus.SUCCESS);
+    task.setStatus(TaskStatus.COMPLETED);
     
     assertThatThrownBy(() -> task.transitionTo(TaskStatus.FAILED))
         .isInstanceOf(IllegalStateTransitionException.class)
@@ -1817,7 +1302,7 @@ void shouldRecoverFromWorkerFailure() {
     // Verify task is recovered and reassigned
     await().atMost(60, SECONDS).until(() -> {
         Task task = getTask(executionId);
-        return task.getStatus() == TaskStatus.SUCCESS;
+        return task.getStatus() == TaskStatus.COMPLETED;
     });
 }
 
@@ -1830,7 +1315,7 @@ void shouldHandleDuplicateKafkaEvents() {
     // Verify task is only marked complete once
     await().pollDelay(2, SECONDS).atMost(5, SECONDS).until(() -> {
         Task task = taskRepository.findById(taskId);
-        return task.getStatus() == TaskStatus.SUCCESS;
+        return task.getStatus() == TaskStatus.COMPLETED;
     });
     
     // Verify no errors logged
@@ -1970,8 +1455,8 @@ COPY --from=builder /build/target/*.jar app.jar
 USER chronos:chronos
 EXPOSE 8080 9080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost:8080/actuator/health || exit 1
-ENTRYPOINT ["java", "-jar", "app.jar"]
+    CMD wget --quiet --tries=1 --spider http://localhost:${MANAGEMENT_PORT}/actuator/health || exit 1
+ENTRYPOINT ["sh", "-c", "exec java ${JAVA_OPTS} -Dserver.port=${SERVER_PORT} -Dmanagement.server.port=${MANAGEMENT_PORT} -jar app.jar"]
 ```
 
 **Benefits**:
@@ -2056,14 +1541,15 @@ healthcheck:
 
 #### Application Services
 
-All application services use Spring Boot Actuator:
+All application services use Spring Boot Actuator. In the `docker` profile actuator runs on a separate
+management port (908x), so the Compose healthcheck targets that port:
 ```yaml
 healthcheck:
-  test: wget --quiet --tries=1 --spider http://localhost:8080/actuator/health
-  interval: 30s
-  timeout: 10s
-  retries: 3
-  start_period: 60s
+  test: wget --quiet --tries=1 --spider http://localhost:9080/actuator/health || exit 1   # 9080-9083
+  interval: 10s
+  timeout: 5s
+  retries: 10
+  start_period: 40s
 ```
 
 **Kubernetes-Ready**:
@@ -2077,8 +1563,8 @@ management:
 ```
 
 Endpoints:
-- `/actuator/health/liveness` - Container should restart if fails
-- `/actuator/health/readiness` - Container should not receive traffic if fails
+- `/actuator/health/liveness` and `/actuator/health/readiness` on the management port
+- `/livez` and `/readyz` on the application port (8080-8083), reachable from the host
 
 ### 9.6 Dependency Management
 
@@ -2262,33 +1748,25 @@ scrape_configs:
         port: 9083
 ```
 
-**Key Metrics**:
-- `chronos_workflow_executions_total` - Total workflow executions
-- `chronos_task_completed_total{status="success|failure"}` - Task outcomes
-- `chronos_worker_active_tasks` - Tasks in progress per worker
+**Key Metrics** (full catalog in [observability-architecture.md](observability-architecture.md)):
+- `chronos_workflow_executions_total{status}` - Finished executions (COMPLETED / FAILED / CANCELLED)
+- `chronos_workflow_duration_seconds` - Execution duration histogram
+- `chronos_tasks_total{outcome}` - Task outcomes (completed / failed / retried / requeued)
+- `chronos_task_execution_seconds{task_type,outcome}` - Task execution time on workers
+- `chronos_worker_tasks_inflight` - Tasks in progress per worker
 - `jvm_memory_used_bytes` - JVM heap usage
 - `http_server_requests_seconds` - API latency
 
 #### Grafana Dashboards
 
-Pre-configured dashboards:
-1. **Workflow Execution Dashboard**
-   - Execution rate over time
-   - Success/failure ratio
-   - Average execution duration
-   - Workflow status distribution
+One provisioned dashboard, **Chronos Overview** (`http://localhost:3000/d/chronos-overview`):
+- **Health**: services up, workers up, scheduler leader, active executions, tasks in flight, outbox backlog
+- **Workflows**: executions finished per minute by status, success rate, duration p50/p95/p99, API activity
+- **Tasks**: outcomes (completed / failed / retried / requeued), dispatch rate, execution time p95 by
+  task type, dead-lettered tasks
+- **Kafka & services**: consumer lag, HTTP request rate and p95 latency, JVM heap
 
-2. **Service Health Dashboard**
-   - CPU and memory usage per service
-   - JVM heap utilization
-   - Garbage collection metrics
-   - Request rates and latencies
-
-3. **Infrastructure Dashboard**
-   - MongoDB operations per second
-   - Redis hit/miss ratio
-   - Kafka lag and throughput
-   - Container resource usage
+Alert rules are in `infrastructure/prometheus/alerts.yml` (visible at `http://localhost:9090/alerts`).
 
 #### Log Aggregation
 
@@ -2415,7 +1893,7 @@ docker compose build scheduler-service
 docker compose up -d --no-deps scheduler-service
 
 # 3. Verify new version
-curl http://localhost:8082/actuator/health
+curl http://localhost:8082/readyz
 
 # 4. View logs
 ./scripts/logs.sh scheduler --follow
@@ -2564,5 +2042,5 @@ docker compose up --build
 - ✓ Complete monitoring and metrics
 - ✓ Production-grade reliability
 
-For setup instructions, see [SETUP.md](../SETUP.md).  
-For troubleshooting, see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
+For setup instructions, see the [README](../README.md#-quick-start) and [local-development.md](./local-development.md).  
+For troubleshooting, see [docs/README.md](./README.md#troubleshooting).

@@ -18,11 +18,9 @@ if not current_leader then
     return -1
 end
 
--- Extract scheduler ID from value (format: schedulerId:timestamp)
-local current_scheduler_id = string.match(current_leader, "^([^:]+)")
-
--- Not the current leader
-if current_scheduler_id ~= ARGV[1] then
+-- Value format: schedulerId:timestamp (scheduler IDs may themselves contain ':')
+local prefix = ARGV[1] .. ':'
+if current_leader ~= ARGV[1] and string.sub(current_leader, 1, #prefix) ~= prefix then
     return 0
 end
 

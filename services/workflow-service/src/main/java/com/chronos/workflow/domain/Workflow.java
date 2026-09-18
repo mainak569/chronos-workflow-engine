@@ -31,7 +31,8 @@ public class Workflow {
      * Indexed for efficient lookup of user's workflows.
      */
     @NotBlank(message = "Owner ID is required")
-    @Indexed
+    // Name matches MongoDB's default ("ownerId_1"); see User.email
+    @Indexed(name = "ownerId_1")
     private String ownerId;
 
     /**
@@ -52,6 +53,17 @@ public class Workflow {
     @NotEmpty(message = "Workflow must contain at least one task")
     @Valid
     private List<TaskDefinition> tasks = new ArrayList<>();
+
+    /**
+     * Optional cron expression (Spring format, 6 fields) for recurring executions.
+     * Null means the workflow only runs when triggered through the API.
+     */
+    private String schedule;
+
+    /**
+     * Time zone used to evaluate {@link #schedule} (defaults to UTC).
+     */
+    private String timezone;
 
     /**
      * Timestamp when this workflow was created.
@@ -88,6 +100,22 @@ public class Workflow {
     }
     
     // Getters and Setters
+
+    public String getSchedule() {
+        return schedule;
+    }
+
+    public void setSchedule(String schedule) {
+        this.schedule = schedule;
+    }
+
+    public String getTimezone() {
+        return timezone;
+    }
+
+    public void setTimezone(String timezone) {
+        this.timezone = timezone;
+    }
     public String getId() {
         return id;
     }
@@ -166,6 +194,8 @@ public class Workflow {
         private Instant createdAt;
         private Instant updatedAt;
         private Long version;
+        private String schedule;
+        private String timezone;
         
         public Builder id(String id) {
             this.id = id;
@@ -207,8 +237,21 @@ public class Workflow {
             return this;
         }
         
+        public Builder schedule(String schedule) {
+            this.schedule = schedule;
+            return this;
+        }
+        
+        public Builder timezone(String timezone) {
+            this.timezone = timezone;
+            return this;
+        }
+        
         public Workflow build() {
-            return new Workflow(id, ownerId, name, description, tasks, createdAt, updatedAt, version);
+            Workflow workflow = new Workflow(id, ownerId, name, description, tasks, createdAt, updatedAt, version);
+            workflow.setSchedule(schedule);
+            workflow.setTimezone(timezone);
+            return workflow;
         }
     }
 

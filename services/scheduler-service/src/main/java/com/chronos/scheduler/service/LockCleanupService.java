@@ -1,6 +1,7 @@
 package com.chronos.scheduler.service;
 
 import com.chronos.scheduler.config.LockConfiguration;
+import com.chronos.scheduler.leader.LeaderElectionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -22,12 +23,15 @@ public class LockCleanupService {
     
     private final RedisTemplate<String, String> redisTemplate;
     private final LockConfiguration.LockProperties lockProperties;
-    
+    private final LeaderElectionService leaderElectionService;
+
     public LockCleanupService(
             RedisTemplate<String, String> redisTemplate,
-            LockConfiguration.LockProperties lockProperties) {
+            LockConfiguration.LockProperties lockProperties,
+            LeaderElectionService leaderElectionService) {
         this.redisTemplate = redisTemplate;
         this.lockProperties = lockProperties;
+        this.leaderElectionService = leaderElectionService;
     }
     
     /**
@@ -35,6 +39,16 @@ public class LockCleanupService {
      * Runs at the configured cleanup interval (default: every 1 minute).
      */
     @Scheduled(fixedDelayString = "#{@lockProperties.getCleanupInterval().toMillis()}")
+    public void scheduledCleanup() {
+        // Only one scheduler instance needs to sweep the shared Redis
+        if (leaderElectionService.isLeader()) {
+            cleanupOrphanedLocks();
+        }
+    }
+    
+    /**
+     * Clean up orphaned locks now.
+     */
     public void cleanupOrphanedLocks() {
         logger.debug("Starting orphaned lock cleanup");
         
@@ -171,6 +185,12 @@ public class LockCleanupService {
      * @param lockKey the lock key to clean up
      * @return true if the lock was cleaned up, false otherwise
      */
+    public boolean isManagedLockKey(String lockKey) {
+        return lockKey != null
+                && (lockKey.startsWith(lockProperties.getTaskLockPrefix())
+                    || lockKey.startsWith(lockProperties.getExecutionLockPrefix()));
+    }
+    
     public boolean cleanupSpecificLock(String lockKey) {
         logger.info("Manual cleanup requested for lock: key={}", lockKey);
         

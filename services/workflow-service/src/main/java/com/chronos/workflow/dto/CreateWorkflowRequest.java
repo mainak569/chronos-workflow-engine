@@ -21,6 +21,16 @@ public class CreateWorkflowRequest {
     @NotEmpty(message = "Workflow must contain at least one task")
     @Valid
     private List<TaskDefinition> tasks = new ArrayList<>();
+
+    /**
+     * Optional cron expression (Spring format, e.g. "0 0 * * * *") for recurring executions.
+     */
+    private String schedule;
+
+    /**
+     * Optional time zone for the schedule (defaults to UTC).
+     */
+    private String timezone;
     
     // Constructors
     public CreateWorkflowRequest() {
@@ -33,6 +43,22 @@ public class CreateWorkflowRequest {
     }
     
     // Getters and Setters
+
+    public String getSchedule() {
+        return schedule;
+    }
+
+    public void setSchedule(String schedule) {
+        this.schedule = schedule;
+    }
+
+    public String getTimezone() {
+        return timezone;
+    }
+
+    public void setTimezone(String timezone) {
+        this.timezone = timezone;
+    }
     public String getName() {
         return name;
     }

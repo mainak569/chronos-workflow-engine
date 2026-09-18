@@ -1,45 +1,24 @@
 // MongoDB initialization script for Chronos
-
 db = db.getSiblingDB('chronos');
 
-// Create collections
+// Create collections used by the services
 db.createCollection('users');
 db.createCollection('workflows');
-db.createCollection('executions');
-db.createCollection('tasks');
-db.createCollection('workers');
+db.createCollection('workflow_executions');
+db.createCollection('task_executions');
+db.createCollection('scheduler_state');
+db.createCollection('outbox_messages');
 
 print('Collections created successfully');
 
-// Create indexes for users collection
-db.users.createIndex({ email: 1 }, { unique: true });
-print('Users indexes created');
-
-// Create indexes for workflows collection
-db.workflows.createIndex({ ownerId: 1 });
-db.workflows.createIndex({ name: 1, ownerId: 1 });
-db.workflows.createIndex({ createdAt: -1 });
-print('Workflows indexes created');
-
-// Create indexes for executions collection
-db.executions.createIndex({ workflowId: 1 });
-db.executions.createIndex({ ownerId: 1, createdAt: -1 });
-db.executions.createIndex({ status: 1 });
-db.executions.createIndex({ correlationId: 1 });
-print('Executions indexes created');
-
-// Create indexes for tasks collection
-db.tasks.createIndex({ executionId: 1 });
-db.tasks.createIndex({ executionId: 1, taskId: 1 }, { unique: true });
-db.tasks.createIndex({ status: 1 });
-db.tasks.createIndex({ workerId: 1 });
-db.tasks.createIndex({ nextRetryAt: 1 }, { sparse: true });
-db.tasks.createIndex({ status: 1, dependenciesMet: 1 });
-print('Tasks indexes created');
-
-// Create indexes for workers collection
-db.workers.createIndex({ status: 1 });
-db.workers.createIndex({ lastHeartbeatAt: -1 });
-print('Workers indexes created');
+// Indexes are created by the services themselves (spring.data.mongodb.auto-index-creation)
+// from the @Indexed/@CompoundIndex annotations on the domain classes. Creating the same
+// index keys here under different names would make the services fail at startup
+// (MongoDB error 85, IndexOptionsConflict).
+//
+// Upgrading from an older volume that still has indexes from a previous version of this
+// script? Drop the conflicting ones once:
+//   db.users.dropIndex("email_1"); db.workflows.dropIndex("ownerId_1");
+// or start from scratch with: docker compose down -v
 
 print('MongoDB initialization completed successfully');

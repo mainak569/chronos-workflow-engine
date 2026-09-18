@@ -3,6 +3,8 @@ package com.chronos.scheduler.leader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -11,7 +13,6 @@ import org.springframework.scripting.support.ResourceScriptSource;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
@@ -50,12 +51,13 @@ public class LeaderElectionService {
     private final RedisTemplate<String, String> redisTemplate;
     private final String schedulerId;
     private final DefaultRedisScript<Long> renewalScript;
+    private final DefaultRedisScript<Long> releaseScript;
     
     @Value("${chronos.scheduler.leader-election.ttl:30s}")
-    private Duration leadershipTtl;
+    private Duration leadershipTtl = Duration.ofSeconds(30);
     
     @Value("${chronos.scheduler.leader-election.renewal-interval:10000}")
-    private long renewalIntervalMs;
+    private long renewalIntervalMs = 10000;
     
     public LeaderElectionService(
             RedisTemplate<String, String> redisTemplate,
@@ -69,6 +71,12 @@ public class LeaderElectionService {
                 new ResourceScriptSource(new ClassPathResource("scripts/renew_leadership.lua"))
         );
         this.renewalScript.setResultType(Long.class);
+        
+        this.releaseScript = new DefaultRedisScript<>();
+        this.releaseScript.setScriptSource(
+                new ResourceScriptSource(new ClassPathResource("scripts/release_leadership.lua"))
+        );
+        this.releaseScript.setResultType(Long.class);
     }
     
     @PostConstruct
@@ -87,7 +95,7 @@ public class LeaderElectionService {
      */
     public boolean isLeader() {
         String currentLeader = redisTemplate.opsForValue().get(LEADER_KEY);
-        boolean isLeader = schedulerId.equals(currentLeader);
+        boolean isLeader = isHeldBySelf(currentLeader);
         
         if (log.isTraceEnabled()) {
             log.trace("Leadership check: currentLeader={}, myId={}, isLeader={}",
@@ -199,14 +207,17 @@ public class LeaderElectionService {
             return;
         }
         
-        // Only delete if we are still the leader (check-and-delete)
-        String currentLeader = redisTemplate.opsForValue().get(LEADER_KEY);
-        if (schedulerId.equals(currentLeader)) {
-            redisTemplate.delete(LEADER_KEY);
+        // Atomic check-and-delete: only removes the key if we still hold it
+        Long released = redisTemplate.execute(
+                releaseScript,
+                Collections.singletonList(LEADER_KEY),
+                schedulerId
+        );
+        if (released != null && released == 1) {
             log.info("Leadership released: schedulerId={}", schedulerId);
             recordLeadershipTransition("RELEASED");
         } else {
-            log.warn("Leadership already lost to: {}", currentLeader);
+            log.warn("Leadership already lost before release: schedulerId={}", schedulerId);
         }
     }
     
@@ -234,7 +245,7 @@ public class LeaderElectionService {
         return new LeadershipStatus(
                 schedulerId,
                 currentLeader,
-                schedulerId.equals(currentLeader),
+                isHeldBySelf(currentLeader),
                 ttl != null ? ttl : -1,
                 Instant.now()
         );
@@ -260,14 +271,23 @@ public class LeaderElectionService {
     /**
      * Build leadership value containing scheduler ID and timestamp.
      */
+    /**
+     * The leader key holds "schedulerId:timestamp"; leadership belongs to us if the ID part matches.
+     */
+    private boolean isHeldBySelf(String leadershipValue) {
+        return leadershipValue != null
+                && (leadershipValue.equals(schedulerId) || leadershipValue.startsWith(schedulerId + ":"));
+    }
+    
     private String buildLeadershipValue() {
         return schedulerId + ":" + Instant.now();
     }
     
     /**
-     * Cleanup on shutdown.
+     * Release leadership when the application context closes, before the Redis
+     * connection factory is stopped, so a standby scheduler can take over immediately.
      */
-    @PreDestroy
+    @EventListener(ContextClosedEvent.class)
     public void shutdown() {
         log.info("LeaderElectionService shutting down");
         releaseLeadership();

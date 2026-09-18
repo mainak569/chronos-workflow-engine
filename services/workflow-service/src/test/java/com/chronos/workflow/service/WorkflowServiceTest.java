@@ -6,6 +6,7 @@ import com.chronos.workflow.domain.Workflow;
 import com.chronos.workflow.dto.CreateWorkflowRequest;
 import com.chronos.workflow.dto.WorkflowResponse;
 import com.chronos.workflow.exception.WorkflowNotFoundException;
+import com.chronos.workflow.metrics.WorkflowMetrics;
 import com.chronos.workflow.repository.WorkflowRepository;
 import com.chronos.workflow.validation.WorkflowValidator;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +33,9 @@ class WorkflowServiceTest {
 
     @Mock
     private WorkflowValidator workflowValidator;
+
+    @Mock
+    private WorkflowMetrics metrics;
 
     @InjectMocks
     private WorkflowService workflowService;

@@ -5,7 +5,7 @@ spring:
   # MongoDB Configuration
   data:
     mongodb:
-      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos}
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos?authSource=admin}
       database: ${MONGODB_DATABASE:chronos}
       auto-index-creation: true
   
@@ -40,7 +40,8 @@ chronos:
     jwt:
       # Secret key for JWT signing (MUST be set via environment variable in production)
       # Minimum 256 bits (32 characters) for HS256
-      secret: ${CHRONOS_JWT_SECRET:changeme-this-is-not-secure-for-production-use-at-least-32-chars}
+      # Must match the API gateway's JWT_SECRET
+      secret: ${CHRONOS_JWT_SECRET:${JWT_SECRET:changeme-this-is-not-secure-for-production-use-at-least-32-chars}}
       # Token expiration in milliseconds (default: 24 hours)
       expiration: ${CHRONOS_JWT_EXPIRATION:86400000}
 
@@ -82,6 +83,11 @@ management:
   endpoint:
     health:
       show-details: always
+      # Liveness/readiness groups, also served on the main server port as /livez and /readyz
+      # (actuator itself runs on a separate management port in the docker profile)
+      probes:
+        enabled: true
+        add-additional-paths: true
       show-components: always
     prometheus:
       enabled: true

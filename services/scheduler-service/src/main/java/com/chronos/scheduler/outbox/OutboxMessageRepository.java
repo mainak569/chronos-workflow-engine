@@ -1,5 +1,6 @@
 package com.chronos.scheduler.outbox;
 
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.mongodb.repository.MongoRepository;
 import org.springframework.data.mongodb.repository.Query;
 import org.springframework.stereotype.Repository;
@@ -21,6 +22,8 @@ public interface OutboxMessageRepository extends MongoRepository<OutboxMessage, 
      */
     @Query("{ 'status': 'PENDING' }")
     List<OutboxMessage> findPendingMessages();
+    
+    List<OutboxMessage> findByStatusOrderByCreatedAtAsc(OutboxStatus status, Pageable pageable);
     
     /**
      * Find failed messages that can be retried.

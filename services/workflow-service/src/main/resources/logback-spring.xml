@@ -95,7 +95,7 @@
     </springProfile>
     
     <!-- Default configuration (JSON) -->
-    <springProfile name="!dev & !local & !prod & !production">
+    <springProfile name="!dev &amp; !local &amp; !prod &amp; !production">
         <root level="INFO">
             <appender-ref ref="CONSOLE_JSON"/>
         </root>

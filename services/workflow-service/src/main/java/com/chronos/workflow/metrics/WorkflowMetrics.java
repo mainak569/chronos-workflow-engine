@@ -2,123 +2,53 @@ package com.chronos.workflow.metrics;
 
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Timer;
 import org.springframework.stereotype.Component;
 
-import java.time.Duration;
-import java.time.Instant;
-import java.util.concurrent.TimeUnit;
-
 /**
- * Metrics for workflow operations.
- * Tracks workflow executions, failures, duration, and active workflows.
+ * Workflow API metrics (exposed at /actuator/prometheus).
+ *
+ * Labels are deliberately low-cardinality (no workflow or user IDs), so the number of
+ * time series stays constant no matter how many workflows exist.
+ * Execution outcomes (COMPLETED / FAILED) are recorded by the scheduler service, which
+ * drives executions; this service records the ones it decides itself (CANCELLED).
  */
 @Component
 public class WorkflowMetrics {
-    
-    private final MeterRegistry registry;
-    
+
+    private final Counter workflowsCreated;
+    private final Counter workflowsDeleted;
+    private final Counter executionsStarted;
+    private final Counter executionsCancelled;
+
     public WorkflowMetrics(MeterRegistry registry) {
-        this.registry = registry;
+        this.workflowsCreated = Counter.builder("chronos.workflows.created")
+                .description("Workflow definitions created")
+                .register(registry);
+        this.workflowsDeleted = Counter.builder("chronos.workflows.deleted")
+                .description("Workflow definitions deleted")
+                .register(registry);
+        this.executionsStarted = Counter.builder("chronos.workflow.executions.started")
+                .description("Workflow executions started through the API")
+                .register(registry);
+        this.executionsCancelled = Counter.builder("chronos.workflow.executions")
+                .description("Workflow executions that reached a final status")
+                .tag("status", "CANCELLED")
+                .register(registry);
     }
-    
-    /**
-     * Record workflow execution start.
-     *
-     * @param workflowId Workflow identifier
-     * @param status Execution status (RUNNING, COMPLETED, FAILED)
-     */
-    public void recordWorkflowExecution(String workflowId, String status) {
-        Counter.builder("chronos.workflow.executions")
-                .description("Total workflow executions")
-                .tag("workflow_id", workflowId)
-                .tag("status", status)
-                .register(registry)
-                .increment();
+
+    public void recordWorkflowCreated() {
+        workflowsCreated.increment();
     }
-    
-    /**
-     * Record workflow duration.
-     *
-     * @param workflowId Workflow identifier
-     * @param startTime Workflow start time
-     * @param status Final status
-     */
-    public void recordWorkflowDuration(String workflowId, Instant startTime, String status) {
-        Duration duration = Duration.between(startTime, Instant.now());
-        
-        Timer.builder("chronos.workflow.duration")
-                .description("Workflow execution duration")
-                .tag("workflow_id", workflowId)
-                .tag("status", status)
-                .publishPercentiles(0.5, 0.95, 0.99)
-                .publishPercentileHistogram()
-                .register(registry)
-                .record(duration.toMillis(), TimeUnit.MILLISECONDS);
+
+    public void recordWorkflowDeleted() {
+        workflowsDeleted.increment();
     }
-    
-    /**
-     * Record workflow failure.
-     *
-     * @param workflowId Workflow identifier
-     * @param errorType Type of error
-     */
-    public void recordWorkflowFailure(String workflowId, String errorType) {
-        Counter.builder("chronos.workflow.failures")
-                .description("Total workflow failures")
-                .tag("workflow_id", workflowId)
-                .tag("error_type", errorType)
-                .register(registry)
-                .increment();
+
+    public void recordExecutionStarted() {
+        executionsStarted.increment();
     }
-    
-    /**
-     * Increment active workflow count.
-     *
-     * @param workflowId Workflow identifier
-     */
-    public void incrementActiveWorkflows(String workflowId) {
-        registry.gauge("chronos.workflow.active", 
-                java.util.Collections.singletonList(io.micrometer.core.instrument.Tag.of("workflow_id", workflowId)),
-                1);
-    }
-    
-    /**
-     * Decrement active workflow count.
-     *
-     * @param workflowId Workflow identifier
-     */
-    public void decrementActiveWorkflows(String workflowId) {
-        registry.gauge("chronos.workflow.active", 
-                java.util.Collections.singletonList(io.micrometer.core.instrument.Tag.of("workflow_id", workflowId)),
-                0);
-    }
-    
-    /**
-     * Record workflow created.
-     *
-     * @param workflowId Workflow identifier
-     * @param ownerId Owner user ID
-     */
-    public void recordWorkflowCreated(String workflowId, String ownerId) {
-        Counter.builder("chronos.workflow.created")
-                .description("Total workflows created")
-                .tag("workflow_id", workflowId)
-                .tag("owner_id", ownerId)
-                .register(registry)
-                .increment();
-    }
-    
-    /**
-     * Record workflow deleted.
-     *
-     * @param workflowId Workflow identifier
-     */
-    public void recordWorkflowDeleted(String workflowId) {
-        Counter.builder("chronos.workflow.deleted")
-                .description("Total workflows deleted")
-                .tag("workflow_id", workflowId)
-                .register(registry)
-                .increment();
+
+    public void recordExecutionCancelled() {
+        executionsCancelled.increment();
     }
 }

@@ -18,7 +18,7 @@ In a distributed system with multiple worker instances:
 Workers use Redis `SET NX EX` (Set if Not eXists with EXpiration) to atomically claim a task:
 
 ```
-Key: chronos:lock:task:{taskId}
+Key: chronos:lock:task:{executionId}:{taskId}
 Value: {workerId}:{uuid}
 TTL: 5 minutes (configurable)
 ```
@@ -51,7 +51,7 @@ Worker receives TaskReadyEvent
     ↓
 Check if task type is supported
     ↓
-Attempt atomic claim: SET NX chronos:lock:task:{taskId} {workerId}:{uuid} EX 300
+Attempt atomic claim: SET NX chronos:lock:task:{executionId}:{taskId} {workerId}:{uuid} EX 300
     ↓
     ├─ SUCCESS (returned true) ──→ Execute task
     │                               ↓
@@ -221,13 +221,14 @@ Both workers executing (SPLIT BRAIN)
 ### Lock Key Naming
 
 ```
-chronos:lock:task:{taskId}
+chronos:lock:task:{executionId}:{taskId}
 ```
 
 **Benefits:**
 - Namespace isolation: `chronos:lock:*`
-- Easy to identify lock purpose: `task:{taskId}`
-- Supports cleanup queries: `KEYS chronos:lock:task:*`
+- Task IDs are only unique within a workflow, so the execution ID is part of the key; otherwise two
+  executions of the same workflow would block each other
+- Supports cleanup queries: `SCAN 0 MATCH chronos:lock:task:*`
 
 ### Lock TTL Configuration
 

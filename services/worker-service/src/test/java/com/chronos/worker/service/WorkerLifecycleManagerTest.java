@@ -5,6 +5,7 @@ import com.chronos.worker.domain.WorkerStatus;
 import com.chronos.worker.event.WorkerEventPublisher;
 import com.chronos.worker.event.WorkerRegisteredEvent;
 import com.chronos.worker.event.WorkerUnavailableEvent;
+import com.chronos.worker.shutdown.GracefulShutdownManager;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -40,6 +41,9 @@ class WorkerLifecycleManagerTest {
     private WorkerEventPublisher eventPublisher;
     
     @Mock
+    private GracefulShutdownManager shutdownManager;
+    
+    @Mock
     private ContextRefreshedEvent contextRefreshedEvent;
     
     private WorkerLifecycleManager lifecycleManager;
@@ -49,7 +53,8 @@ class WorkerLifecycleManagerTest {
         lifecycleManager = new WorkerLifecycleManager(
                 workerRegistry,
                 heartbeatScheduler,
-                eventPublisher
+                eventPublisher,
+                shutdownManager
         );
     }
     
@@ -83,23 +88,18 @@ class WorkerLifecycleManagerTest {
     }
     
     @Test
-    @DisplayName("Should generate worker ID if not configured")
-    void shouldGenerateWorkerIdIfNotConfigured() {
-        // Given
-        List<String> taskTypes = Arrays.asList("IMAGE_RESIZE");
+    @DisplayName("Should fail fast if the worker ID is blank")
+    void shouldFailIfWorkerIdBlank() {
+        // Given: a blank ID (WorkerIdEnvironmentPostProcessor normally prevents this)
+        ReflectionTestUtils.setField(lifecycleManager, "workerId", "");
+        ReflectionTestUtils.setField(lifecycleManager, "supportedTaskTypes", Arrays.asList("IMAGE_RESIZE"));
         
-        ReflectionTestUtils.setField(lifecycleManager, "workerId", null);
-        ReflectionTestUtils.setField(lifecycleManager, "supportedTaskTypes", taskTypes);
+        // When/Then: registration fails instead of inventing an ID that other components don't share
+        assertThatThrownBy(() -> lifecycleManager.onApplicationReady())
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Worker ID");
         
-        // When
-        lifecycleManager.onApplicationReady();
-        
-        // Then
-        verify(workerRegistry).registerWorker(any(WorkerMetadata.class));
-        
-        String generatedId = lifecycleManager.getWorkerId();
-        assertThat(generatedId).isNotNull();
-        assertThat(generatedId).startsWith("worker-");
+        verify(workerRegistry, never()).registerWorker(any(WorkerMetadata.class));
     }
     
     @Test

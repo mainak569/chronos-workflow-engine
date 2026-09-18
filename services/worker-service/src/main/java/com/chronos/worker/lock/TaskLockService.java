@@ -36,7 +36,7 @@ public class TaskLockService {
     private final DistributedLock distributedLock;
     
     @Value("${chronos.lock.task-lock-ttl:5m}")
-    private Duration defaultLockTtl;
+    private Duration defaultLockTtl = Duration.ofMinutes(5);
     
     public TaskLockService(DistributedLock distributedLock) {
         this.distributedLock = distributedLock;

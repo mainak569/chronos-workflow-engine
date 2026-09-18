@@ -58,8 +58,8 @@ class AuthenticationServiceTest {
     void shouldRegisterNewUserSuccessfully() {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "john@example.com",
+                "johndoe",
                 "SecurePass123!"
         );
 
@@ -106,8 +106,8 @@ class AuthenticationServiceTest {
     void shouldThrowExceptionWhenEmailExists() {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "john@example.com",
+                "johndoe",
                 "SecurePass123!"
         );
 
@@ -239,8 +239,8 @@ class AuthenticationServiceTest {
     void shouldNotExposePlaintextPassword() {
         // Given
         RegisterRequest request = new RegisterRequest(
-                "johndoe",
                 "john@example.com",
+                "johndoe",
                 "SecurePass123!"
         );
 

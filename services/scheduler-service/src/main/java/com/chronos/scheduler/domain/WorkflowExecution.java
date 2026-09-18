@@ -3,6 +3,7 @@ package com.chronos.scheduler.domain;
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.annotation.LastModifiedDate;
+import org.springframework.data.annotation.Version;
 import org.springframework.data.mongodb.core.index.CompoundIndex;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
@@ -35,6 +36,12 @@ public class WorkflowExecution {
      * Name of the workflow (denormalized for convenience).
      */
     private String workflowName;
+    
+    /**
+     * ID of the user who owns the workflow (used for access control).
+     */
+    @Indexed
+    private String ownerId;
     
     /**
      * User ID who triggered this execution.
@@ -99,6 +106,7 @@ public class WorkflowExecution {
     /**
      * Version for optimistic locking.
      */
+    @Version
     private Long version;
     
     // Constructors
@@ -214,6 +222,14 @@ public class WorkflowExecution {
         this.workflowName = workflowName;
     }
 
+    public String getOwnerId() {
+        return ownerId;
+    }
+
+    public void setOwnerId(String ownerId) {
+        this.ownerId = ownerId;
+    }
+
     public String getTriggeredBy() {
         return triggeredBy;
     }
@@ -320,6 +336,7 @@ public class WorkflowExecution {
         private String id;
         private String workflowId;
         private String workflowName;
+        private String ownerId;
         private String triggeredBy;
         private ExecutionStatus status = ExecutionStatus.PENDING;
         private Map<String, Object> input = new HashMap<>();
@@ -345,6 +362,11 @@ public class WorkflowExecution {
         
         public Builder workflowName(String workflowName) {
             this.workflowName = workflowName;
+            return this;
+        }
+        
+        public Builder ownerId(String ownerId) {
+            this.ownerId = ownerId;
             return this;
         }
         
@@ -409,9 +431,11 @@ public class WorkflowExecution {
         }
         
         public WorkflowExecution build() {
-            return new WorkflowExecution(id, workflowId, workflowName, triggeredBy, status, 
+            WorkflowExecution execution = new WorkflowExecution(id, workflowId, workflowName, triggeredBy, status, 
                     input, output, errorMessage, errorType, createdAt, updatedAt, 
                     startedAt, completedAt, durationMs, version);
+            execution.setOwnerId(ownerId);
+            return execution;
         }
     }
 }

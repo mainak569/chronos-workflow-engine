@@ -94,11 +94,25 @@ chronos:
     execution-idempotency:
       ttl: ${EXECUTION_IDEMPOTENCY_TTL:1h}
     
-    # Restart Recovery
+    # Task retry backoff defaults (per-task retryConfig overrides these)
+    retry:
+      initial-delay: ${TASK_RETRY_INITIAL_DELAY:5s}
+      backoff-multiplier: ${TASK_RETRY_BACKOFF_MULTIPLIER:2.0}
+      max-delay: ${TASK_RETRY_MAX_DELAY:5m}
+    
+    # Recovery sweeps (leader only)
     restart-recovery:
       enabled: ${RECOVERY_ENABLED:true}
-      task-republish-delay: ${RECOVERY_REPUBLISH_DELAY:1m}
+      # Re-dispatch attempts that no worker picked up within this time
+      dispatch-timeout: ${RECOVERY_DISPATCH_TIMEOUT:5m}
+      retry-sweep-interval: ${RECOVERY_RETRY_SWEEP_INTERVAL:2000}   # milliseconds
+      sweep-interval: ${RECOVERY_SWEEP_INTERVAL:60000}               # milliseconds
+      initial-delay: ${RECOVERY_INITIAL_DELAY:15000}                 # milliseconds
   
+  # Admin REST API (/api/locks/**) token; empty disables the admin API
+  admin:
+    token: ${CHRONOS_ADMIN_TOKEN:}
+
   # Distributed Lock Configuration
   lock:
     task-lock-ttl: ${TASK_LOCK_TTL:5m}

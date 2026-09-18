@@ -1,27 +1,28 @@
 package com.chronos.workflow.controller;
 
-import com.chronos.workflow.domain.TaskExecution;
 import com.chronos.workflow.domain.WorkflowExecution;
 import com.chronos.workflow.dto.ExecutionRequest;
 import com.chronos.workflow.dto.ExecutionResponse;
 import com.chronos.workflow.dto.TaskExecutionResponse;
 import com.chronos.workflow.service.WorkflowExecutionService;
-import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * REST controller for workflow execution operations.
+ * Every operation is scoped to the authenticated user: executions of other users are reported as not found.
  */
 @RestController
 @RequestMapping("/api/v1/workflows")
+@PreAuthorize("isAuthenticated()")
 public class WorkflowExecutionController {
     
     private static final Logger logger = LoggerFactory.getLogger(WorkflowExecutionController.class);
@@ -33,70 +34,65 @@ public class WorkflowExecutionController {
     }
     
     /**
+     * Get the authenticated user's ID (the JWT subject).
+     */
+    private String getAuthenticatedUserId() {
+        return SecurityContextHolder.getContext().getAuthentication().getName();
+    }
+    
+    /**
      * Start a workflow execution.
      * 
      * POST /api/v1/workflows/{workflowId}/execute
      * 
      * @param workflowId Workflow definition ID
-     * @param request Execution request with triggeredBy and input
+     * @param request Optional execution request with input parameters
      * @return Created execution details
      */
     @PostMapping("/{workflowId}/execute")
     public ResponseEntity<ExecutionResponse> executeWorkflow(
             @PathVariable String workflowId,
-            @Valid @RequestBody ExecutionRequest request) {
+            @RequestBody(required = false) ExecutionRequest request) {
         
-        logger.info("Received execution request: workflowId={}, triggeredBy={}", 
-                workflowId, request.getTriggeredBy());
+        String userId = getAuthenticatedUserId();
+        logger.info("Received execution request: workflowId={}, userId={}", workflowId, userId);
         
-        WorkflowExecution execution = executionService.startExecution(
-                workflowId,
-                request.getTriggeredBy(),
-                request.getInput()
-        );
-        
-        ExecutionResponse response = new ExecutionResponse(execution);
+        Map<String, Object> input = request != null ? request.getInput() : null;
+        WorkflowExecution execution = executionService.startExecution(workflowId, userId, input);
         
         logger.info("Workflow execution started: executionId={}, workflowId={}", 
                 execution.getId(), workflowId);
         
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        return ResponseEntity.status(HttpStatus.CREATED).body(new ExecutionResponse(execution));
     }
     
     /**
-     * Get workflow execution details.
+     * Get execution details.
      * 
      * GET /api/v1/workflows/executions/{executionId}
-     * 
-     * @param executionId Execution ID
-     * @return Execution details
      */
     @GetMapping("/executions/{executionId}")
     public ResponseEntity<ExecutionResponse> getExecution(@PathVariable String executionId) {
         logger.debug("Getting execution: executionId={}", executionId);
         
-        return executionService.getExecution(executionId)
-                .map(ExecutionResponse::new)
-                .map(ResponseEntity::ok)
-                .orElse(ResponseEntity.notFound().build());
+        WorkflowExecution execution = executionService.getExecution(executionId, getAuthenticatedUserId());
+        return ResponseEntity.ok(new ExecutionResponse(execution));
     }
     
     /**
      * Get all task executions for a workflow execution.
      * 
      * GET /api/v1/workflows/executions/{executionId}/tasks
-     * 
-     * @param executionId Execution ID
-     * @return List of task executions
      */
     @GetMapping("/executions/{executionId}/tasks")
     public ResponseEntity<List<TaskExecutionResponse>> getTaskExecutions(@PathVariable String executionId) {
         logger.debug("Getting task executions: executionId={}", executionId);
         
-        List<TaskExecution> taskExecutions = executionService.getTaskExecutions(executionId);
-        List<TaskExecutionResponse> responses = taskExecutions.stream()
+        List<TaskExecutionResponse> responses = executionService
+                .getTaskExecutions(executionId, getAuthenticatedUserId())
+                .stream()
                 .map(TaskExecutionResponse::new)
-                .collect(Collectors.toList());
+                .toList();
         
         return ResponseEntity.ok(responses);
     }
@@ -105,10 +101,6 @@ public class WorkflowExecutionController {
      * Get a specific task execution.
      * 
      * GET /api/v1/workflows/executions/{executionId}/tasks/{taskId}
-     * 
-     * @param executionId Execution ID
-     * @param taskId Task ID
-     * @return Task execution details
      */
     @GetMapping("/executions/{executionId}/tasks/{taskId}")
     public ResponseEntity<TaskExecutionResponse> getTaskExecution(
@@ -117,19 +109,14 @@ public class WorkflowExecutionController {
         
         logger.debug("Getting task execution: executionId={}, taskId={}", executionId, taskId);
         
-        return executionService.getTaskExecution(executionId, taskId)
-                .map(TaskExecutionResponse::new)
-                .map(ResponseEntity::ok)
-                .orElse(ResponseEntity.notFound().build());
+        return ResponseEntity.ok(new TaskExecutionResponse(
+                executionService.getTaskExecution(executionId, taskId, getAuthenticatedUserId())));
     }
     
     /**
      * Get execution statistics.
      * 
      * GET /api/v1/workflows/executions/{executionId}/statistics
-     * 
-     * @param executionId Execution ID
-     * @return Execution statistics
      */
     @GetMapping("/executions/{executionId}/statistics")
     public ResponseEntity<WorkflowExecutionService.ExecutionStatistics> getExecutionStatistics(
@@ -137,25 +124,19 @@ public class WorkflowExecutionController {
         
         logger.debug("Getting execution statistics: executionId={}", executionId);
         
-        WorkflowExecutionService.ExecutionStatistics stats = 
-                executionService.getExecutionStatistics(executionId);
-        
-        return ResponseEntity.ok(stats);
+        return ResponseEntity.ok(executionService.getExecutionStatistics(executionId, getAuthenticatedUserId()));
     }
     
     /**
      * Cancel a workflow execution.
      * 
      * POST /api/v1/workflows/executions/{executionId}/cancel
-     * 
-     * @param executionId Execution ID
-     * @return Success response
      */
     @PostMapping("/executions/{executionId}/cancel")
     public ResponseEntity<Map<String, String>> cancelExecution(@PathVariable String executionId) {
         logger.info("Cancelling execution: executionId={}", executionId);
         
-        executionService.cancelExecution(executionId);
+        executionService.cancelExecution(executionId, getAuthenticatedUserId());
         
         return ResponseEntity.ok(Map.of(
                 "status", "success",

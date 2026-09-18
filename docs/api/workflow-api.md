@@ -1,528 +1,301 @@
-# Workflow Management API
+# Chronos REST API
 
-## Overview
+All examples below were captured from a running Chronos stack.
 
-The Workflow Management API provides endpoints for creating, retrieving, and managing workflow definitions in the Chronos orchestration engine.
+**Base URL:** `http://localhost:8080/api/v1` (API gateway). The workflow service also serves the same
+API directly on `http://localhost:8081/api/v1`.
 
-**Base URL:** `http://localhost:8081/api/v1`
+**Authentication:** every endpoint except `/auth/**` needs `Authorization: Bearer <token>`. Tokens come
+from register or login. Users only see their own workflows and executions: another user's resource
+is reported as `404 Not Found`.
 
-**Authentication:** JWT Bearer Token (to be implemented)
+**Correlation IDs:** send `X-Correlation-ID` to trace a request; the gateway generates one otherwise
+and returns it in the response header and in error bodies.
+
+**Rate limiting:** the gateway allows 120 requests per minute per user (per IP for anonymous calls)
+and answers `429 Too Many Requests` with a `Retry-After` header beyond that.
+
+A Postman collection with every request is in
+[`postman/chronos-api.postman_collection.json`](../../postman/chronos-api.postman_collection.json).
 
 ---
 
-## Endpoints
+## Authentication
 
-### 1. Create Workflow
+### Register — `POST /auth/register`
 
-Creates a new workflow definition.
-
-**Endpoint:** `POST /workflows`
-
-**Request Headers:**
-```
-Content-Type: application/json
-Authorization: Bearer <jwt_token>  (to be implemented)
+```json
+{ "email": "jane@example.com", "username": "jane", "password": "SecurePass123!" }
 ```
 
-**Request Body:**
+`201 Created`
+```json
+{
+  "token": "eyJhbGciOiJIUzUxMiJ9...",
+  "tokenType": "Bearer",
+  "userId": "6aacf2321a704a0127be73bb",
+  "email": "jane@example.com",
+  "username": "jane",
+  "expiresIn": 3600000
+}
+```
+
+`expiresIn` is in milliseconds. Errors: `400` (invalid email, username 3–50 characters,
+password 8–100 characters), `409 DUPLICATE_RESOURCE` (email already registered).
+
+### Login — `POST /auth/login`
+
+```json
+{ "email": "jane@example.com", "password": "SecurePass123!" }
+```
+
+`200 OK` with the same body as register. Wrong credentials: `401 AUTHENTICATION_FAILED`.
+
+---
+
+## Workflows
+
+### Create workflow — `POST /workflows`
+
 ```json
 {
   "name": "Image Processing Pipeline",
-  "description": "Workflow for resizing and optimizing images",
+  "description": "Resize, compress and upload an image",
   "tasks": [
     {
-      "taskId": "download-image",
-      "name": "Download Image",
-      "taskType": "HTTP_DOWNLOAD",
-      "dependencies": [],
-      "configuration": {
-        "url": "${input.imageUrl}",
-        "destination": "/tmp/original.jpg"
-      },
-      "retryConfig": {
-        "maxAttempts": 3,
-        "initialDelayMs": 5000,
-        "backoffMultiplier": 2.0,
-        "maxDelayMs": 300000
-      },
-      "timeoutMs": 60000,
-      "description": "Downloads the source image"
-    },
-    {
-      "taskId": "resize-image",
-      "name": "Resize Image",
+      "taskId": "resize",
+      "name": "Resize image",
       "taskType": "IMAGE_RESIZE",
-      "dependencies": ["download-image"],
-      "configuration": {
-        "width": 800,
-        "height": 600,
-        "maintainAspectRatio": true
-      },
-      "retryConfig": {
-        "maxAttempts": 3,
-        "initialDelayMs": 5000,
-        "backoffMultiplier": 2.0,
-        "maxDelayMs": 300000
-      },
-      "timeoutMs": 120000,
-      "description": "Resizes the image to specified dimensions"
+      "configuration": { "width": 1280, "height": 720 }
     },
     {
-      "taskId": "upload-result",
-      "name": "Upload Result",
-      "taskType": "S3_UPLOAD",
-      "dependencies": ["resize-image"],
-      "configuration": {
-        "bucket": "processed-images",
-        "key": "${input.outputKey}"
-      },
-      "retryConfig": {
-        "maxAttempts": 5,
-        "initialDelayMs": 5000,
-        "backoffMultiplier": 2.0,
-        "maxDelayMs": 300000
-      },
-      "timeoutMs": 60000,
-      "description": "Uploads the processed image to S3"
-    }
-  ]
-}
-```
-
-**Response:** `201 Created`
-```json
-{
-  "workflowId": "65f1b2c3d4e5f6a7b8c9d0e1",
-  "ownerId": "user-123",
-  "name": "Image Processing Pipeline",
-  "description": "Workflow for resizing and optimizing images",
-  "tasks": [ /* same as request */ ],
-  "createdAt": "2026-09-15T13:30:00Z",
-  "updatedAt": "2026-09-15T13:30:00Z"
-}
-```
-
-**Validation Rules:**
-- `name`: Required, non-blank
-- `tasks`: Required, at least one task
-- `taskId`: Required, unique within workflow
-- `name` (task): Required, non-blank
-- `taskType`: Required, non-blank
-- `dependencies`: Must reference existing task IDs
-- No cyclic dependencies allowed
-- `retryConfig.maxAttempts`: ≥ 0
-- `retryConfig.initialDelayMs`: ≥ 0
-- `retryConfig.backoffMultiplier`: ≥ 1.0
-- `retryConfig.maxDelayMs`: ≥ 0
-- `timeoutMs`: > 0
-
-**Error Responses:**
-
-`400 Bad Request` - Validation errors:
-```json
-{
-  "timestamp": "2026-09-15T13:30:00Z",
-  "status": 400,
-  "error": "VALIDATION_ERROR",
-  "message": "Validation failed for request",
-  "path": "/api/v1/workflows",
-  "correlationId": "550e8400-e29b-41d4-a716-446655440000",
-  "fieldErrors": [
+      "taskId": "compress",
+      "name": "Compress image",
+      "taskType": "IMAGE_COMPRESS",
+      "dependencies": ["resize"],
+      "configuration": { "quality": 85 },
+      "retryConfig": { "maxAttempts": 3, "initialDelayMs": 2000, "backoffMultiplier": 2.0, "maxDelayMs": 60000 },
+      "timeoutMs": 60000
+    },
     {
-      "field": "name",
-      "message": "Workflow name is required",
-      "rejectedValue": null
+      "taskId": "validate",
+      "name": "Validate output",
+      "taskType": "DATA_VALIDATION",
+      "dependencies": ["compress"]
     }
   ]
 }
 ```
 
-`400 Bad Request` - Workflow validation errors:
+`201 Created`
 ```json
 {
-  "timestamp": "2026-09-15T13:30:00Z",
-  "status": 400,
-  "error": "WORKFLOW_VALIDATION_ERROR",
-  "message": "Cyclic dependency detected involving task: resize-image",
-  "path": "/api/v1/workflows",
-  "correlationId": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
----
-
-### 2. Get Workflow by ID
-
-Retrieves a specific workflow by its ID.
-
-**Endpoint:** `GET /workflows/{workflowId}`
-
-**Path Parameters:**
-- `workflowId`: Workflow identifier
-
-**Request Headers:**
-```
-Authorization: Bearer <jwt_token>  (to be implemented)
-```
-
-**Response:** `200 OK`
-```json
-{
-  "workflowId": "65f1b2c3d4e5f6a7b8c9d0e1",
-  "ownerId": "user-123",
+  "workflowId": "6aacf2321a704a0127be73bc",
+  "ownerId": "6aacf2321a704a0127be73bb",
   "name": "Image Processing Pipeline",
-  "description": "Workflow for resizing and optimizing images",
-  "tasks": [ /* task definitions */ ],
-  "createdAt": "2026-09-15T13:30:00Z",
-  "updatedAt": "2026-09-15T13:30:00Z"
+  "description": "Resize, compress and upload an image",
+  "tasks": [
+    {
+      "taskId": "resize",
+      "name": "Resize image",
+      "taskType": "IMAGE_RESIZE",
+      "dependencies": [],
+      "configuration": { "width": 1280, "height": 720 },
+      "retryConfig": { "maxAttempts": 3, "initialDelayMs": 5000, "backoffMultiplier": 2.0, "maxDelayMs": 300000 },
+      "timeoutMs": 300000,
+      "description": null
+    }
+  ],
+  "schedule": null,
+  "timezone": null,
+  "createdAt": "2026-09-18T08:11:30.189Z",
+  "updatedAt": "2026-09-18T08:11:30.189Z"
 }
 ```
 
-**Error Responses:**
+**Scheduled workflows:** add a Spring cron expression (6 fields: second minute hour day month weekday)
+and optionally a time zone (default UTC). The scheduler then starts executions automatically:
 
-`404 Not Found` - Workflow not found or not owned by user:
 ```json
-{
-  "timestamp": "2026-09-15T13:30:00Z",
-  "status": 404,
-  "error": "WORKFLOW_NOT_FOUND",
-  "message": "Workflow not found with ID: 65f1b2c3d4e5f6a7b8c9d0e1",
-  "path": "/api/v1/workflows/65f1b2c3d4e5f6a7b8c9d0e1",
-  "correlationId": "550e8400-e29b-41d4-a716-446655440000"
-}
+{ "name": "Nightly report", "schedule": "0 0 2 * * *", "timezone": "Asia/Kolkata", "tasks": [ ... ] }
 ```
+
+**Validation** (`400`):
+- `name` required; at least one task
+- each task: `taskId` (unique), `name`, `taskType` required
+- `dependencies` must reference task IDs of the same workflow; cycles are rejected
+- `retryConfig`: `maxAttempts ≥ 0`, `initialDelayMs ≥ 0`, `backoffMultiplier ≥ 1`, `maxDelayMs ≥ 0`
+- `timeoutMs > 0` (default 300000)
+- `schedule` must be a valid cron expression, `timezone` a valid zone ID
+
+Supported task types (configured on workers): `IMAGE_RESIZE`, `IMAGE_COMPRESS`, `DATA_PROCESSING`,
+`DATA_VALIDATION` (plus `FILE_CONVERSION`, `NOTIFICATION` in Docker).
+
+### List workflows — `GET /workflows`
+
+`200 OK` — array of workflow objects owned by the caller.
+
+### Get workflow — `GET /workflows/{workflowId}`
+
+`200 OK` — workflow object. `404 WORKFLOW_NOT_FOUND` if it does not exist or belongs to someone else.
+
+### Delete workflow — `DELETE /workflows/{workflowId}`
+
+`204 No Content`. Deleting a scheduled workflow also stops its schedule.
 
 ---
 
-### 3. Get All Workflows for User
+## Executions
 
-Retrieves all workflows owned by the authenticated user.
+### Start execution — `POST /workflows/{workflowId}/execute`
 
-**Endpoint:** `GET /workflows`
-
-**Request Headers:**
-```
-Authorization: Bearer <jwt_token>  (to be implemented)
+Body is optional:
+```json
+{ "input": { "imageUrl": "s3://bucket/photo.jpg" } }
 ```
 
-**Response:** `200 OK`
+`201 Created`
+```json
+{
+  "executionId": "6aacf2321a704a0127be73be",
+  "workflowId": "6aacf2321a704a0127be73bc",
+  "workflowName": "Image Processing Pipeline",
+  "triggeredBy": "6aacf2321a704a0127be73bb",
+  "status": "PENDING",
+  "input": { "imageUrl": "s3://bucket/photo.jpg" },
+  "output": null,
+  "errorMessage": null,
+  "errorType": null,
+  "createdAt": "2026-09-18T08:11:30.240Z",
+  "updatedAt": "2026-09-18T08:11:30.240Z",
+  "startedAt": null,
+  "completedAt": null,
+  "durationMs": null
+}
+```
+
+`triggeredBy` is always the authenticated user (`scheduler` for cron runs).
+Execution status: `PENDING → RUNNING → COMPLETED | FAILED | CANCELLED`.
+
+### Get execution — `GET /workflows/executions/{executionId}`
+
+`200 OK` (after completion; `output` aggregates each task's result by task ID):
+```json
+{
+  "executionId": "6aacf2321a704a0127be73be",
+  "status": "COMPLETED",
+  "output": {
+    "resize":   { "status": "success", "attempt": 1, "processedBy": "worker-7f55a92b7d6f", "taskId": "resize" },
+    "compress": { "status": "success", "attempt": 1, "processedBy": "worker-7f55a92b7d6f", "taskId": "compress" },
+    "validate": { "status": "success", "attempt": 1, "processedBy": "worker-7f55a92b7d6f", "taskId": "validate" }
+  },
+  "startedAt": "2026-09-18T08:11:30.836Z",
+  "completedAt": "2026-09-18T08:11:35.891Z",
+  "durationMs": 5055
+}
+```
+(other fields as in the start response)
+
+### Task executions — `GET /workflows/executions/{executionId}/tasks`
+
+`200 OK`
 ```json
 [
   {
-    "workflowId": "65f1b2c3d4e5f6a7b8c9d0e1",
-    "ownerId": "user-123",
-    "name": "Image Processing Pipeline",
-    "description": "Workflow for resizing and optimizing images",
-    "tasks": [ /* task definitions */ ],
-    "createdAt": "2026-09-15T13:30:00Z",
-    "updatedAt": "2026-09-15T13:30:00Z"
-  },
-  {
-    "workflowId": "75f1b2c3d4e5f6a7b8c9d0e2",
-    "ownerId": "user-123",
-    "name": "Data ETL Pipeline",
-    "description": "Extract, transform, and load data",
-    "tasks": [ /* task definitions */ ],
-    "createdAt": "2026-09-14T10:00:00Z",
-    "updatedAt": "2026-09-14T10:00:00Z"
+    "id": "6aacf2321a704a0127be73bf",
+    "executionId": "6aacf2321a704a0127be73be",
+    "taskId": "resize",
+    "taskName": "Resize image",
+    "taskType": "IMAGE_RESIZE",
+    "status": "COMPLETED",
+    "dependsOn": [],
+    "configuration": { "width": 1280, "height": 720 },
+    "input": {},
+    "output": { "status": "success", "attempt": 1, "processedBy": "worker-7f55a92b7d6f", "taskId": "resize" },
+    "errorMessage": null,
+    "errorType": null,
+    "workerId": "worker-7f55a92b7d6f",
+    "attemptNumber": 1,
+    "maxRetries": 3,
+    "retriable": true,
+    "startedAt": "2026-09-18T08:11:30.833Z",
+    "completedAt": "2026-09-18T08:11:31.842Z",
+    "durationMs": 1009
   }
 ]
 ```
 
-**Note:** Returns an empty array if no workflows are found.
+Task status: `PENDING → RUNNING → COMPLETED | FAILED | CANCELLED`. A retriable failure puts the task
+back to `PENDING` with `attemptNumber + 1` until `maxRetries` attempts are used.
 
----
+### Single task — `GET /workflows/executions/{executionId}/tasks/{taskId}`
 
-### 4. Delete Workflow
+`200 OK` — one task object; `404 EXECUTION_NOT_FOUND` if the task does not exist.
 
-Deletes a workflow by its ID.
+### Statistics — `GET /workflows/executions/{executionId}/statistics`
 
-**Endpoint:** `DELETE /workflows/{workflowId}`
-
-**Path Parameters:**
-- `workflowId`: Workflow identifier
-
-**Request Headers:**
-```
-Authorization: Bearer <jwt_token>  (to be implemented)
-```
-
-**Response:** `204 No Content`
-
-**Error Responses:**
-
-`404 Not Found` - Workflow not found or not owned by user:
 ```json
-{
-  "timestamp": "2026-09-15T13:30:00Z",
-  "status": 404,
-  "error": "WORKFLOW_NOT_FOUND",
-  "message": "Workflow not found with ID: 65f1b2c3d4e5f6a7b8c9d0e1",
-  "path": "/api/v1/workflows/65f1b2c3d4e5f6a7b8c9d0e1",
-  "correlationId": "550e8400-e29b-41d4-a716-446655440000"
-}
+{ "totalTasks": 3, "pendingTasks": 0, "runningTasks": 0, "completedTasks": 3,
+  "failedTasks": 0, "cancelledTasks": 0, "completionPercentage": 100.0 }
 ```
 
----
+### Cancel — `POST /workflows/executions/{executionId}/cancel`
 
-## Data Models
-
-### Workflow
-
-| Field | Type | Description |
-|-------|------|-------------|
-| workflowId | string | Unique identifier (MongoDB ObjectId) |
-| ownerId | string | User ID of workflow owner |
-| name | string | Human-readable workflow name |
-| description | string (optional) | Workflow description |
-| tasks | array[TaskDefinition] | List of task definitions |
-| createdAt | timestamp (ISO 8601) | Creation timestamp |
-| updatedAt | timestamp (ISO 8601) | Last modification timestamp |
-
-### TaskDefinition
-
-| Field | Type | Description |
-|-------|------|-------------|
-| taskId | string | Unique identifier within workflow |
-| name | string | Human-readable task name |
-| taskType | string | Task type (determines worker capability) |
-| dependencies | array[string] | Task IDs that must complete first |
-| configuration | object | Task-specific configuration |
-| retryConfig | RetryConfiguration | Retry behavior |
-| timeoutMs | long | Maximum execution time (milliseconds) |
-| description | string (optional) | Task description |
-
-### RetryConfiguration
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| maxAttempts | integer | 3 | Maximum retry attempts (0 = no retries) |
-| initialDelayMs | long | 5000 | Initial delay before first retry (ms) |
-| backoffMultiplier | double | 2.0 | Exponential backoff multiplier |
-| maxDelayMs | long | 300000 | Maximum delay cap (ms) |
-
-**Delay Calculation:** `delay = min(initialDelayMs * (backoffMultiplier ^ (attempt - 1)), maxDelayMs)`
+`200 OK`
+```json
+{ "status": "success", "message": "Execution cancelled", "executionId": "6aacf23b1a704a0127be73c2" }
+```
+Tasks that have not finished are cancelled; a task already running on a worker completes but its result
+is ignored. Cancelling a finished execution returns `409 INVALID_EXECUTION_STATE`.
 
 ---
 
-## Error Handling
+## Errors
 
-All error responses follow a consistent structure:
+All errors use this shape:
 
 ```json
 {
-  "timestamp": "2026-09-15T13:30:00Z",
+  "timestamp": "2026-09-18T08:11:30.206Z",
   "status": 400,
-  "error": "ERROR_CODE",
-  "message": "Human-readable error message",
+  "error": "VALIDATION_ERROR",
+  "message": "Validation failed for request",
   "path": "/api/v1/workflows",
-  "correlationId": "550e8400-e29b-41d4-a716-446655440000",
-  "fieldErrors": [/* optional, only for validation errors */]
+  "correlationId": "3220d177-ff10-40a9-8ba5-53809d292cbc",
+  "fieldErrors": [
+    { "field": "name", "message": "Workflow name is required", "rejectedValue": null }
+  ]
 }
 ```
 
-### Error Codes
-
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| WORKFLOW_NOT_FOUND | 404 | Workflow doesn't exist or not owned by user |
-| WORKFLOW_VALIDATION_ERROR | 400 | Invalid workflow structure (cycles, invalid dependencies) |
-| VALIDATION_ERROR | 400 | Request validation failed (missing required fields, invalid values) |
-| INTERNAL_SERVER_ERROR | 500 | Unexpected server error |
-
-**Correlation ID:** Each error includes a unique correlation ID for tracking and debugging purposes. Include this ID when reporting issues.
-
----
-
-## Examples
-
-### Example 1: Simple Sequential Workflow
-
-```bash
-curl -X POST http://localhost:8081/api/v1/workflows \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Sequential Pipeline",
-    "description": "Three tasks running in sequence",
-    "tasks": [
-      {
-        "taskId": "task-1",
-        "name": "First Task",
-        "taskType": "STEP_1",
-        "dependencies": [],
-        "configuration": {"param": "value1"},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      },
-      {
-        "taskId": "task-2",
-        "name": "Second Task",
-        "taskType": "STEP_2",
-        "dependencies": ["task-1"],
-        "configuration": {"param": "value2"},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      },
-      {
-        "taskId": "task-3",
-        "name": "Third Task",
-        "taskType": "STEP_3",
-        "dependencies": ["task-2"],
-        "configuration": {"param": "value3"},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      }
-    ]
-  }'
-```
-
-### Example 2: Parallel Tasks with Join
-
-```bash
-curl -X POST http://localhost:8081/api/v1/workflows \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "Parallel Processing",
-    "description": "Two parallel tasks followed by a join",
-    "tasks": [
-      {
-        "taskId": "parallel-1",
-        "name": "Parallel Task 1",
-        "taskType": "PROCESS_A",
-        "dependencies": [],
-        "configuration": {},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      },
-      {
-        "taskId": "parallel-2",
-        "name": "Parallel Task 2",
-        "taskType": "PROCESS_B",
-        "dependencies": [],
-        "configuration": {},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      },
-      {
-        "taskId": "join-task",
-        "name": "Join Results",
-        "taskType": "MERGE",
-        "dependencies": ["parallel-1", "parallel-2"],
-        "configuration": {},
-        "retryConfig": {
-          "maxAttempts": 3,
-          "initialDelayMs": 5000,
-          "backoffMultiplier": 2.0,
-          "maxDelayMs": 300000
-        },
-        "timeoutMs": 60000
-      }
-    ]
-  }'
-```
-
-### Example 3: Get All Workflows
-
-```bash
-curl -X GET http://localhost:8081/api/v1/workflows
-```
-
-### Example 4: Get Specific Workflow
-
-```bash
-curl -X GET http://localhost:8081/api/v1/workflows/65f1b2c3d4e5f6a7b8c9d0e1
-```
-
-### Example 5: Delete Workflow
-
-```bash
-curl -X DELETE http://localhost:8081/api/v1/workflows/65f1b2c3d4e5f6a7b8c9d0e1
-```
+| `error` | Status | Meaning |
+|---|---|---|
+| `VALIDATION_ERROR` | 400 | Request fields invalid (see `fieldErrors`) |
+| `WORKFLOW_VALIDATION_ERROR` | 400 | Invalid workflow structure (duplicate IDs, unknown dependency, cycle, bad cron) |
+| `MALFORMED_REQUEST` | 400 | Body missing or not valid JSON |
+| `UNAUTHORIZED` | 401 | Missing, invalid or expired Bearer token |
+| `AUTHENTICATION_FAILED` | 401 | Wrong email or password |
+| `FORBIDDEN` | 403 | Access denied |
+| `WORKFLOW_NOT_FOUND` | 404 | Workflow missing or owned by another user |
+| `EXECUTION_NOT_FOUND` | 404 | Execution or task missing or owned by another user |
+| `DUPLICATE_RESOURCE` | 409 | Email already registered |
+| `INVALID_EXECUTION_STATE` | 409 | Operation not allowed in the current state |
+| `CONCURRENT_MODIFICATION` | 409 | Resource changed concurrently, retry |
+| `RATE_LIMIT_EXCEEDED` | 429 | Too many requests through the gateway |
+| `BAD_GATEWAY` / `GATEWAY_TIMEOUT` | 502 / 504 | Gateway could not reach the workflow service |
+| `INTERNAL_SERVER_ERROR` | 500 | Unexpected error |
 
 ---
 
-## Notes
+## Simulated Tasks
 
-### Current Limitations
+Workers do not run real image or data processing: each attempt sleeps and returns a result. The task
+`configuration` can control this, which is useful for trying out retries and failures:
 
-1. **Authentication:** Currently using hardcoded `ownerId = "user-123"`. JWT-based authentication will be implemented in a future phase.
+| Key | Effect |
+|---|---|
+| `simulateDurationMs` | How long the attempt runs (default 1000) |
+| `failUntilAttempt` | Fail with a retriable error while `attemptNumber <= value` |
+| `failPermanently` | Fail with a non-retriable error (no retries, execution fails) |
 
-2. **Workflow Execution:** This API only manages workflow definitions. Actual workflow execution (triggering, scheduling, status tracking) will be implemented in subsequent phases.
-
-3. **Updates:** Workflow updates are not yet supported. Create a new workflow or delete and recreate.
-
-4. **Pagination:** The GET /workflows endpoint returns all workflows. Pagination will be added when needed.
-
-### Validation Details
-
-**Workflow Validation Process:**
-1. Validate request structure (JSON, required fields)
-2. Validate task uniqueness (no duplicate task IDs)
-3. Validate dependencies (all referenced tasks exist)
-4. Detect cyclic dependencies using depth-first search (DFS)
-
-**Cycle Detection:** The system prevents workflows with circular dependencies (e.g., Task A depends on Task B, Task B depends on Task C, Task C depends on Task A).
-
-### MongoDB Indexes
-
-The following indexes are automatically created:
-- `ownerId`: For efficient user workflow lookups
-- `createdAt`: For time-based queries and sorting
-
----
-
-## Testing
-
-Unit tests and integration tests are available in:
-- `src/test/java/com/chronos/workflow/validation/WorkflowValidatorTest.java` - 9 tests for validation logic
-- `src/test/java/com/chronos/workflow/service/WorkflowServiceTest.java` - 6 tests for service operations
-- `src/test/java/com/chronos/workflow/repository/WorkflowRepositoryIntegrationTest.java` - Integration tests with MongoDB (requires Docker)
-
-Run tests:
-```bash
-# Unit tests only (no Docker required)
-mvn test -Dtest='**/*Test,!**/*IntegrationTest'
-
-# All tests (requires Docker for MongoDB Testcontainers)
-mvn test
-```
-
----
-
-## Changelog
-
-### Version 1.0.0 - 2026-09-15
-
-**Initial Release**
-- POST /workflows - Create workflow
-- GET /workflows/{workflowId} - Get workflow by ID
-- GET /workflows - List user workflows
-- DELETE /workflows/{workflowId} - Delete workflow
-- Workflow validation (uniqueness, dependencies, cycles)
-- Structured error responses with correlation IDs
-- MongoDB persistence with indexes
+Combined with `timeoutMs`, a `simulateDurationMs` above the timeout exercises timeout handling.

@@ -1,29 +1,33 @@
 package com.chronos.scheduler.outbox;
 
+import com.chronos.scheduler.leader.LeaderElectionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Background service that publishes outbox messages to Kafka.
  * 
  * Polling Strategy:
  * - Runs every 1 second (configurable)
- * - Processes pending messages in batches
+ * - Runs on the leader scheduler only, so instances don't publish the same message concurrently
+ * - Processes pending messages in batches, oldest first
  * - Marks as published after Kafka confirmation
- * - Retries failed messages with exponential backoff
+ * - Retries failed sends on the next polls; after max attempts the message is FAILED
+ *   and re-queued by the periodic failed-message retry
  * - Cleans up old published messages
  * 
  * Guarantees:
@@ -44,6 +48,7 @@ public class OutboxPublisherService {
     private final OutboxMessageRepository outboxMessageRepository;
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final ObjectMapper objectMapper;
+    private final LeaderElectionService leaderElectionService;
     
     @Value("${chronos.outbox.poll-interval:1000}")
     private long pollIntervalMs;
@@ -60,10 +65,12 @@ public class OutboxPublisherService {
     public OutboxPublisherService(
             OutboxMessageRepository outboxMessageRepository,
             KafkaTemplate<String, Object> kafkaTemplate,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            LeaderElectionService leaderElectionService) {
         this.outboxMessageRepository = outboxMessageRepository;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
+        this.leaderElectionService = leaderElectionService;
     }
     
     /**
@@ -72,8 +79,12 @@ public class OutboxPublisherService {
      */
     @Scheduled(fixedDelayString = "${chronos.outbox.poll-interval:1000}")
     public void publishPendingMessages() {
+        if (!leaderElectionService.isLeader()) {
+            return;
+        }
         try {
-            List<OutboxMessage> pending = outboxMessageRepository.findPendingMessages();
+            List<OutboxMessage> pending = outboxMessageRepository.findByStatusOrderByCreatedAtAsc(
+                    OutboxStatus.PENDING, PageRequest.of(0, batchSize));
             
             if (pending.isEmpty()) {
                 log.trace("No pending outbox messages");
@@ -116,7 +127,6 @@ public class OutboxPublisherService {
      * @param message outbox message
      * @return true if published successfully
      */
-    @Transactional
     protected boolean publishMessage(OutboxMessage message) {
         try {
             // Deserialize payload to proper type
@@ -130,8 +140,8 @@ public class OutboxPublisherService {
                     payload
             );
             
-            // Wait for confirmation (blocks, but necessary for exactly-once semantics)
-            SendResult<String, Object> result = future.get();
+            // Wait for broker confirmation before marking the message as published
+            SendResult<String, Object> result = future.get(30, TimeUnit.SECONDS);
             
             // Mark as published
             message.markPublished();
@@ -162,14 +172,14 @@ public class OutboxPublisherService {
      * @param message the message that failed
      * @param error the error
      */
-    @Transactional
     protected void handlePublishFailure(OutboxMessage message, Exception error) {
         try {
             message.incrementAttempt();
+            message.setLastError(error.getMessage());
             
             if (!message.canRetry(maxAttempts)) {
                 // Max attempts reached, mark as failed
-                message.markFailed(error.getMessage());
+                message.setStatus(OutboxStatus.FAILED);
                 log.error("Message permanently failed after {} attempts: id={}, topic={}",
                         message.getAttemptCount(), message.getId(), message.getTopic());
             }
@@ -182,11 +192,14 @@ public class OutboxPublisherService {
     }
     
     /**
-     * Retry failed messages that haven't exceeded max attempts.
-     * Runs every 5 minutes.
+     * Give messages that exhausted their attempts another round of attempts
+     * (e.g. after a longer Kafka outage). Runs every 5 minutes.
      */
     @Scheduled(fixedDelay = 300000) // 5 minutes
     public void retryFailedMessages() {
+        if (!leaderElectionService.isLeader()) {
+            return;
+        }
         try {
             List<OutboxMessage> failed = outboxMessageRepository.findFailedMessages();
             
@@ -196,21 +209,14 @@ public class OutboxPublisherService {
             
             log.info("Retrying {} failed outbox messages", failed.size());
             
-            int retried = 0;
-            int skipped = 0;
-            
             for (OutboxMessage message : failed) {
-                if (message.canRetry(maxAttempts)) {
-                    // Reset to PENDING for retry
-                    message.setStatus(OutboxStatus.PENDING);
-                    outboxMessageRepository.save(message);
-                    retried++;
-                } else {
-                    skipped++;
-                }
+                // Reset to PENDING with a fresh set of attempts
+                message.setAttemptCount(0);
+                message.setStatus(OutboxStatus.PENDING);
+                outboxMessageRepository.save(message);
             }
             
-            log.info("Failed message retry complete: retried={}, skipped={}", retried, skipped);
+            log.info("Failed message retry complete: requeued={}", failed.size());
             
         } catch (Exception e) {
             log.error("Error retrying failed messages", e);
@@ -223,6 +229,9 @@ public class OutboxPublisherService {
      */
     @Scheduled(cron = "0 0 0 * * *")
     public void cleanupOldMessages() {
+        if (!leaderElectionService.isLeader()) {
+            return;
+        }
         try {
             Instant cutoff = Instant.now().minus(cleanupAfter);
             List<OutboxMessage> oldMessages = outboxMessageRepository.findPublishedBefore(cutoff);

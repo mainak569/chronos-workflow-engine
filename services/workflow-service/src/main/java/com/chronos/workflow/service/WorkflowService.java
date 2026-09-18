@@ -5,6 +5,7 @@ import com.chronos.workflow.dto.CreateWorkflowRequest;
 import com.chronos.workflow.dto.WorkflowResponse;
 import com.chronos.workflow.event.WorkflowEventPublisher;
 import com.chronos.workflow.exception.WorkflowNotFoundException;
+import com.chronos.workflow.metrics.WorkflowMetrics;
 import com.chronos.workflow.repository.WorkflowRepository;
 import com.chronos.workflow.validation.WorkflowValidator;
 import org.slf4j.Logger;
@@ -25,13 +26,16 @@ public class WorkflowService {
     private final WorkflowRepository workflowRepository;
     private final WorkflowValidator workflowValidator;
     private final WorkflowEventPublisher eventPublisher;
-    
-    public WorkflowService(WorkflowRepository workflowRepository, 
+    private final WorkflowMetrics metrics;
+
+    public WorkflowService(WorkflowRepository workflowRepository,
                           WorkflowValidator workflowValidator,
-                          WorkflowEventPublisher eventPublisher) {
+                          WorkflowEventPublisher eventPublisher,
+                          WorkflowMetrics metrics) {
         this.workflowRepository = workflowRepository;
         this.workflowValidator = workflowValidator;
         this.eventPublisher = eventPublisher;
+        this.metrics = metrics;
     }
 
     /**
@@ -51,6 +55,8 @@ public class WorkflowService {
                 .name(request.getName())
                 .description(request.getDescription())
                 .tasks(request.getTasks())
+                .schedule(request.getSchedule())
+                .timezone(request.getTimezone())
                 .build();
 
         // Validate workflow structure
@@ -70,6 +76,8 @@ public class WorkflowService {
         // Execution events are published by WorkflowExecutionService
         // TODO: Consider renaming this event or creating separate WorkflowDefinitionCreated event
 
+        metrics.recordWorkflowCreated();
+        
         return WorkflowResponse.from(savedWorkflow);
     }
 
@@ -127,6 +135,7 @@ public class WorkflowService {
         }
 
         workflowRepository.deleteById(workflowId);
+        metrics.recordWorkflowDeleted();
 
         log.info("Deleted workflow: id={}", workflowId);
     }

@@ -149,11 +149,13 @@ db.tasks.getIndexes()
 - Log Retention: 24 hours
 - Max Message Size: 10MB
 
-**Topics** (auto-created):
-- `workflow-events` - Workflow lifecycle events (3 partitions)
-- `task-events` - Task lifecycle events (6 partitions)
-- `worker-events` - Worker health events (1 partition)
-- `dead-letter-queue` - Failed tasks (1 partition)
+**Topics** (auto-created, 6 partitions each):
+- `chronos.workflow.created` - Execution started (workflow service → scheduler)
+- `chronos.task.ready` - Task attempt dispatched (scheduler outbox → workers)
+- `chronos.task.started` / `chronos.task.completed` / `chronos.task.failed` - Task results (workers → scheduler)
+- `chronos.task.failed.permanently` - Dead letter queue for tasks that exhausted their retries
+- `chronos.worker.registered` / `chronos.worker.unavailable` - Worker lifecycle
+- `<topic>.dlt` - Records a consumer could not process after retries
 
 **Persistent Volume**:
 - `chronos-kafka-data` → `/var/lib/kafka/data`
@@ -169,13 +171,13 @@ make kafka-topics
 docker exec chronos-kafka kafka-topics --bootstrap-server localhost:9092 --list
 
 # Describe a topic
-docker exec chronos-kafka kafka-topics --bootstrap-server localhost:9092 --describe --topic task-events
+docker exec chronos-kafka kafka-topics --bootstrap-server localhost:9092 --describe --topic chronos.task.ready
 
 # Consume from a topic
-docker exec chronos-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic task-events --from-beginning
+docker exec chronos-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic chronos.task.completed --from-beginning
 
-# Produce to a topic (testing)
-docker exec -it chronos-kafka kafka-console-producer --bootstrap-server localhost:9092 --topic task-events
+# Consumer group lag of the workers
+docker exec chronos-kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group worker-group
 ```
 
 ---
@@ -204,14 +206,17 @@ docker exec -it chronos-kafka kafka-console-producer --bootstrap-server localhos
 **Configuration**:
 - Persistence: AOF (Append-Only File) with fsync every second
 - Max Memory: 256MB
-- Eviction Policy: allkeys-lru
+- Eviction Policy: noeviction (locks and the leader key must never be evicted; writes fail instead)
 - Snapshots: Enabled (900s/1 change, 300s/10 changes, 60s/10000 changes)
 
 **Data Structures**:
-- `task:{executionId}:{taskId}:lock` - Task locks (TTL: 5 minutes)
-- `worker:{workerId}:heartbeat` - Worker heartbeats (TTL: 30 seconds)
-- `worker:{workerId}:metadata` - Worker metadata (persistent)
-- `scheduler:leader:lock` - Scheduler leader lock (TTL: 10 seconds)
+- `chronos:lock:task:{executionId}:{taskId}` - Task locks (TTL: 5 minutes, renewed while running)
+- `chronos:lease:task:{executionId}:{taskId}` - Task leases (TTL: 5 minutes)
+- `worker:heartbeat:{workerId}` - Worker heartbeats (TTL: 30 seconds)
+- `worker:metadata:{workerId}` - Worker metadata JSON (until deregistered)
+- `chronos:scheduler:leader` - Scheduler leader (`{schedulerId}:{timestamp}`, TTL: 30 seconds)
+- `chronos:event:processed:{eventId}` - Processed-event markers for idempotency (TTL: 7 days)
+- `chronos:execution:idempotency:{workflowId}:{slot}` - Cron slot → execution ID (TTL: 1 hour)
 
 **Persistent Volume**:
 - `chronos-redis-data` → `/data`
@@ -232,14 +237,14 @@ docker exec -it chronos-redis redis-cli
 # List all keys (careful in production!)
 KEYS *
 
-# Get worker heartbeat
-GET worker:worker-01:heartbeat
+# List worker heartbeats
+SCAN 0 MATCH worker:heartbeat:*
 
-# Check task lock
-GET task:execution-123:task-456:lock
+# Check a task lock
+GET chronos:lock:task:<executionId>:<taskId>
 
 # Get scheduler leader
-GET scheduler:leader:lock
+GET chronos:scheduler:leader
 
 # Monitor commands in real-time
 MONITOR
@@ -263,11 +268,11 @@ INFO memory
 - Retention Size: 5GB
 - Storage Path: `/prometheus`
 
-**Targets** (scraped):
-- API Gateway: `api-gateway:8080/actuator/prometheus`
-- Workflow Service: `workflow-service:8081/actuator/prometheus`
-- Scheduler Service: `scheduler-service:8082/actuator/prometheus`
-- Worker Service: `worker-service:8083/actuator/prometheus` (all instances)
+**Targets** (scraped on the management ports inside the Docker network):
+- API Gateway: `api-gateway:9080/actuator/prometheus`
+- Workflow Service: `workflow-service:9081/actuator/prometheus`
+- Scheduler Service: `scheduler-service:9082/actuator/prometheus`
+- Worker Service: `worker-service:9083/actuator/prometheus` (all instances, via DNS discovery)
 
 **Persistent Volume**:
 - `chronos-prometheus-data` → `/prometheus`
@@ -278,17 +283,17 @@ INFO memory
 
 **Useful Queries**:
 ```promql
-# Total workflows created
-workflow_created_total
+# Workflow executions finished per minute, by status
+sum by (status) (rate(chronos_workflow_executions_total[5m])) * 60
 
-# Task execution rate
-rate(task_completed_total[5m])
+# Task outcomes per minute (completed / failed / retried / requeued)
+sum by (outcome) (rate(chronos_tasks_total[5m])) * 60
 
-# Active workers
-worker_available_count
+# Workers up
+count(up{job="worker-service"} == 1)
 
 # Kafka consumer lag
-kafka_consumer_lag
+max by (job) (kafka_consumer_fetch_manager_records_lag_max)
 
 # Task retry rate
 rate(task_retry_total[5m])
@@ -562,8 +567,8 @@ make infra-status
 # Check application status
 make app-status
 
-# Check specific service
-curl http://localhost:8081/actuator/health
+# Check specific service (readiness on the application port)
+curl http://localhost:8081/readyz
 ```
 
 ### Logs
@@ -591,8 +596,8 @@ docker compose logs --tail=100 scheduler-service
 # Show metrics URLs
 make metrics
 
-# View specific service metrics
-curl http://localhost:8081/actuator/prometheus
+# View specific service metrics (actuator is on the management port inside Docker)
+docker compose exec workflow-service wget -qO- localhost:9081/actuator/prometheus | grep chronos_
 
 # View Prometheus UI
 open http://localhost:9090
@@ -616,7 +621,7 @@ make kafka-topics
 # Consume Kafka messages
 docker exec chronos-kafka kafka-console-consumer \
   --bootstrap-server localhost:9092 \
-  --topic task-events \
+  --topic chronos.task.completed \
   --from-beginning
 ```
 
@@ -788,7 +793,7 @@ command: >
 
 - [Architecture Documentation](architecture.md)
 - [Design Decisions](design-decisions.md)
-- [Failure Scenarios](failure-scenarios.md)
+- [Failure Scenarios](failure-recovery-guarantees.md)
 - [API Documentation](../README.md#api-documentation)
 
 ---

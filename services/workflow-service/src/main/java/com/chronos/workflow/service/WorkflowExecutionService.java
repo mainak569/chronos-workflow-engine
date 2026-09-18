@@ -2,9 +2,12 @@ package com.chronos.workflow.service;
 
 import com.chronos.workflow.domain.*;
 import com.chronos.workflow.event.WorkflowEventPublisher;
+import com.chronos.workflow.exception.ExecutionNotFoundException;
+import com.chronos.workflow.exception.InvalidExecutionStateException;
 import com.chronos.workflow.exception.WorkflowNotFoundException;
 import com.chronos.workflow.repository.TaskExecutionRepository;
 import com.chronos.workflow.repository.WorkflowExecutionRepository;
+import com.chronos.workflow.metrics.WorkflowMetrics;
 import com.chronos.workflow.repository.WorkflowRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,16 +30,19 @@ public class WorkflowExecutionService {
     private final WorkflowExecutionRepository executionRepository;
     private final TaskExecutionRepository taskExecutionRepository;
     private final WorkflowEventPublisher eventPublisher;
+    private final WorkflowMetrics metrics;
     
     public WorkflowExecutionService(
             WorkflowRepository workflowRepository,
             WorkflowExecutionRepository executionRepository,
             TaskExecutionRepository taskExecutionRepository,
-            WorkflowEventPublisher eventPublisher) {
+            WorkflowEventPublisher eventPublisher,
+            WorkflowMetrics metrics) {
         this.workflowRepository = workflowRepository;
         this.executionRepository = executionRepository;
         this.taskExecutionRepository = taskExecutionRepository;
         this.eventPublisher = eventPublisher;
+        this.metrics = metrics;
     }
     
     /**
@@ -44,23 +50,25 @@ public class WorkflowExecutionService {
      * Creates execution record, initializes task executions, and publishes WorkflowCreated event.
      *
      * @param workflowId Workflow definition ID
-     * @param triggeredBy User who triggered the execution
+     * @param userId Authenticated user starting the execution (must own the workflow)
      * @param input Input parameters for the workflow
      * @return Created workflow execution
      */
     @Transactional
-    public WorkflowExecution startExecution(String workflowId, String triggeredBy, Map<String, Object> input) {
-        logger.info("Starting workflow execution: workflowId={}, triggeredBy={}", workflowId, triggeredBy);
-        
+    public WorkflowExecution startExecution(String workflowId, String userId, Map<String, Object> input) {
+        logger.info("Starting workflow execution: workflowId={}, userId={}", workflowId, userId);
+
         // Load workflow definition
-        Workflow workflow = workflowRepository.findById(workflowId)
-                .orElseThrow(() -> new WorkflowNotFoundException("Workflow not found: " + workflowId));
+        // Only the owner may execute a workflow
+        Workflow workflow = workflowRepository.findByIdAndOwnerId(workflowId, userId)
+                .orElseThrow(() -> new WorkflowNotFoundException(workflowId));
         
         // Create workflow execution
         WorkflowExecution execution = WorkflowExecution.builder()
                 .workflowId(workflowId)
                 .workflowName(workflow.getName())
-                .triggeredBy(triggeredBy)
+                .ownerId(workflow.getOwnerId())
+                .triggeredBy(userId)
                 .status(ExecutionStatus.PENDING)
                 .input(input != null ? input : new HashMap<>())
                 .build();
@@ -73,6 +81,7 @@ public class WorkflowExecutionService {
         
         // Publish WorkflowCreated event
         eventPublisher.publishWorkflowCreated(execution);
+        metrics.recordExecutionStarted();
         
         logger.info("Workflow execution started successfully: executionId={}", execution.getId());
         return execution;
@@ -98,7 +107,8 @@ public class WorkflowExecutionService {
      * Create a TaskExecution from a TaskDefinition.
      */
     private TaskExecution createTaskExecution(WorkflowExecution execution, TaskDefinition taskDef) {
-        return TaskExecution.builder()
+        RetryConfiguration retryConfig = taskDef.getRetryConfig();
+        TaskExecution taskExecution = TaskExecution.builder()
                 .executionId(execution.getId())
                 .workflowId(execution.getWorkflowId())
                 .taskId(taskDef.getTaskId())
@@ -110,31 +120,46 @@ public class WorkflowExecutionService {
                 .configuration(taskDef.getConfiguration() != null ? taskDef.getConfiguration() : new HashMap<>())
                 .input(new HashMap<>())
                 .attemptNumber(1)
-                .maxRetries(taskDef.getRetryConfig() != null ? 
-                        taskDef.getRetryConfig().getMaxAttempts() : 3)
+                .maxRetries(retryConfig != null && retryConfig.getMaxAttempts() != null ?
+                        retryConfig.getMaxAttempts() : 3)
                 .retriable(true)
                 .build();
+        taskExecution.setTimeoutMs(taskDef.getTimeoutMs());
+        if (retryConfig != null) {
+            taskExecution.setRetryInitialDelayMs(retryConfig.getInitialDelayMs());
+            taskExecution.setRetryBackoffMultiplier(retryConfig.getBackoffMultiplier());
+            taskExecution.setRetryMaxDelayMs(retryConfig.getMaxDelayMs());
+        }
+        return taskExecution;
     }
     
     /**
-     * Get a workflow execution by ID.
+     * Get a workflow execution owned by the given user.
+     *
+     * @throws ExecutionNotFoundException if it does not exist or belongs to another user
      */
-    public Optional<WorkflowExecution> getExecution(String executionId) {
-        return executionRepository.findById(executionId);
+    public WorkflowExecution getExecution(String executionId, String ownerId) {
+        return executionRepository.findById(executionId)
+                .filter(execution -> ownerId.equals(execution.getOwnerId()))
+                .orElseThrow(() -> new ExecutionNotFoundException("Execution not found: " + executionId));
     }
     
     /**
-     * Get all task executions for a workflow execution.
+     * Get all task executions for a workflow execution owned by the given user.
      */
-    public List<TaskExecution> getTaskExecutions(String executionId) {
+    public List<TaskExecution> getTaskExecutions(String executionId, String ownerId) {
+        getExecution(executionId, ownerId);
         return taskExecutionRepository.findByExecutionId(executionId);
     }
     
     /**
-     * Get a specific task execution.
+     * Get a specific task execution of an execution owned by the given user.
      */
-    public Optional<TaskExecution> getTaskExecution(String executionId, String taskId) {
-        return taskExecutionRepository.findByExecutionIdAndTaskId(executionId, taskId);
+    public TaskExecution getTaskExecution(String executionId, String taskId, String ownerId) {
+        getExecution(executionId, ownerId);
+        return taskExecutionRepository.findByExecutionIdAndTaskId(executionId, taskId)
+                .orElseThrow(() -> new ExecutionNotFoundException(
+                        "Task not found: executionId=" + executionId + ", taskId=" + taskId));
     }
     
     /**
@@ -197,8 +222,9 @@ public class WorkflowExecutionService {
         logger.debug("Execution stats: executionId={}, total={}, completed={}, failed={}, running={}", 
                 executionId, totalTasks, completedTasks, failedTasks, runningTasks);
         
-        // Transition to RUNNING if we have running tasks and still in PENDING
-        if (execution.getStatus() == ExecutionStatus.PENDING && runningTasks > 0) {
+        // Transition to RUNNING as soon as any task has left PENDING
+        long pendingTasks = taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.PENDING);
+        if (execution.getStatus() == ExecutionStatus.PENDING && pendingTasks < totalTasks) {
             execution.start();
             executionRepository.save(execution);
             logger.info("Transitioned execution to RUNNING: executionId={}", executionId);
@@ -251,14 +277,18 @@ public class WorkflowExecutionService {
      * Cancels all non-terminal tasks and transitions execution to CANCELLED.
      *
      * @param executionId Workflow execution ID
+     * @param ownerId Authenticated user (must own the execution)
      */
     @Transactional
-    public void cancelExecution(String executionId) {
+    public void cancelExecution(String executionId, String ownerId) {
         logger.info("Cancelling workflow execution: executionId={}", executionId);
-        
-        WorkflowExecution execution = executionRepository.findById(executionId)
-                .orElseThrow(() -> new IllegalArgumentException("Execution not found: " + executionId));
-        
+
+        WorkflowExecution execution = getExecution(executionId, ownerId);
+        if (execution.getStatus().isTerminal()) {
+            throw new InvalidExecutionStateException(
+                    "Execution " + executionId + " is already " + execution.getStatus());
+        }
+
         // Cancel the workflow execution
         execution.cancel();
         executionRepository.save(execution);
@@ -271,6 +301,7 @@ public class WorkflowExecutionService {
             }
         }
         taskExecutionRepository.saveAll(tasks);
+        metrics.recordExecutionCancelled();
         
         logger.info("Workflow execution cancelled: executionId={}", executionId);
     }
@@ -278,8 +309,9 @@ public class WorkflowExecutionService {
     /**
      * Get execution statistics.
      */
-    public ExecutionStatistics getExecutionStatistics(String executionId) {
-        long total = taskExecutionRepository.countByExecutionId(executionId);
+    public ExecutionStatistics getExecutionStatistics(String executionId, String ownerId) {
+        getExecution(executionId, ownerId);
+long total = taskExecutionRepository.countByExecutionId(executionId);
         long pending = taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.PENDING);
         long running = taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.RUNNING);
         long completed = taskExecutionRepository.countByExecutionIdAndStatus(executionId, ExecutionStatus.COMPLETED);

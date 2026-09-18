@@ -46,28 +46,22 @@ Exactly-once execution is extremely difficult to achieve in distributed systems 
    - WorkerMonitorService detects expired heartbeat (runs every 15s)
    - Worker marked as UNAVAILABLE
    
-2. **Task lease expires** (5 minutes without activity)
-   - TaskRecoveryService scans for expired leases (runs every 30s)
-   - Detects TASK-100 lease expired
-   
-3. **Automatic recovery:**
-   - Force-release distributed lock (allow new claims)
-   - Delete expired lease (clean up metadata)
-   - Republish TaskReadyEvent to Kafka
-   - Available worker claims and executes task
+2. **Automatic recovery (scheduler leader):**
+   - Tasks RUNNING on the lost worker are put back to PENDING (same attempt number)
+   - Task locks still held by the lost worker are released (`WorkerFailureHandler`)
+   - The scheduler dispatches the tasks again through the outbox
 
 **Timeline:**
 ```
 T+0s:    Worker crashes
-T+30s:   Heartbeat expires, worker marked UNAVAILABLE
-T+300s:  Lease expires
-T+330s:  Recovery service detects expired lease
-T+330s:  Task reassigned via Kafka
-T+331s:  New worker claims and executes task
+T+30s:   Heartbeat expires
+T+30-45s: WorkerMonitorService marks worker UNAVAILABLE, requeues its RUNNING tasks
+          and releases their locks
+T+31-46s: TaskReady re-dispatched via the outbox; another worker executes the task
 ```
 
 **Guarantees:**
-- 🟢 Task will be recovered within (lease TTL + scan interval) = ~5.5 minutes
+- 🟢 Task will be recovered within heartbeat TTL + monitor interval (~45s); if a TaskReady is lost, the stale-dispatch sweep re-dispatches it after the dispatch timeout (5 minutes)
 - 🟡 Task may execute twice if worker crashed after completing but before releasing lock
 - 🟢 No unsafe concurrent execution (locks prevent races)
 
@@ -81,10 +75,10 @@ T+331s:  New worker claims and executes task
 ```
 
 **Recovery:**
-1. Lease expires after 5 minutes
-2. TaskRecoveryService republishes task
-3. Worker-2 claims TASK-200
-4. **Both workers may be executing simultaneously**
+1. Worker-1 keeps renewing its lease and lock while the task runs, so no other worker claims it
+2. If Worker-1 stops heartbeating, the scheduler requeues the task and Worker-2 may run it
+3. **Both workers may then be executing simultaneously**; the scheduler accepts the first result
+   for the attempt and ignores the duplicate
 
 **Mitigation:**
 - **Task implementations must be idempotent** - duplicate execution is safe
@@ -105,24 +99,26 @@ T+331s:  New worker claims and executes task
    - `SocketTimeoutException`, `ConnectException`, `IOException` → retriable
    - `IllegalArgumentException`, `SecurityException` → non-retriable
    
-2. **Retry with exponential backoff:**
-   - Attempt 1 fails → wait 5 seconds
-   - Attempt 2 fails → wait 30 seconds (5 * 6^1)
-   - Attempt 3 fails → wait 3 minutes (5 * 6^2 = 180s)
-   - Attempt 4+ → capped at 5 minutes
+2. **Retry with exponential backoff (owned by the scheduler):**
+   - The worker reports the failed attempt (attempt number + retriable flag)
+   - The scheduler puts the task back to PENDING with `nextRetryAt = now + delay`,
+     where delay = `initialDelayMs * backoffMultiplier^(attempt-1)`, capped at `maxDelayMs`
+     (from the task's `retryConfig`: defaults 5s, ×2, 5 minutes)
+   - The retry sweep dispatches the next attempt once `nextRetryAt` has passed
+   - Results from older attempts are ignored
 
-3. **After maxRetries exhausted:**
-   - Task moved to Dead Letter Queue (DLQ)
-   - TaskFailedPermanentlyEvent published to `chronos.task.failed.permanently`
+3. **After `retryConfig.maxAttempts` attempts:**
+   - Task marked FAILED, the workflow execution fails, unstarted tasks are cancelled
+   - TaskFailedPermanentlyEvent published to `chronos.task.failed.permanently` (DLQ)
 
-**Configuration:**
+**Configuration (scheduler defaults, overridden per task by retryConfig):**
 ```yaml
 chronos:
-  retry:
-    max-attempts: 3
-    base-delay: 5s
-    backoff-multiplier: 6.0
-    max-delay: 5m
+  scheduler:
+    retry:
+      initial-delay: 5s
+      backoff-multiplier: 2.0
+      max-delay: 5m
 ```
 
 ### 4. Permanent Failures (Logic Errors)
@@ -204,7 +200,8 @@ try {
 **Implementation:**
 - `WorkerHeartbeatScheduler` sends heartbeat every **10 seconds**
 - Heartbeat stored in Redis: `worker:heartbeat:{workerId}` with **30s TTL**
-- `WorkerMonitorService` scans for expired heartbeats every **15 seconds**
+- `WorkerMonitorService` (leader scheduler) scans for expired heartbeats every **15 seconds** and hands lost
+  workers to `WorkerFailureHandler` (requeue running tasks, release their locks, re-dispatch)
 
 **Key:** `worker:heartbeat:{workerId}`  
 **Value:** ISO-8601 timestamp  
@@ -219,9 +216,9 @@ try {
 - Lock token format: `{workerId}:{UUID}`
 - Atomic claim with TTL
 
-**Key:** `chronos:lock:task:{taskId}`  
+**Key:** `chronos:lock:task:{executionId}:{taskId}` (task IDs are only unique within an execution)  
 **Value:** `worker-001:a1b2c3d4-...`  
-**TTL:** 5 minutes (default)
+**TTL:** 5 minutes (default), renewed while the task runs
 
 **Lua script for safe release:**
 ```lua
@@ -234,43 +231,46 @@ end
 
 ### 3. Task Execution Leases
 
-**Purpose:** Track task ownership and enable recovery
+**Purpose:** Record which worker is executing which attempt (for diagnostics)
 
 **Implementation:**
-- `TaskLeaseService` stores execution metadata
-- Includes: taskId, executionId, workerId, lockToken, attemptNumber, expiresAt
+- `TaskLeaseService` stores execution metadata; `TaskLeaseRenewalService` extends leases (and locks)
+  of running tasks every 2 minutes
+- Includes: task key, executionId, workerId, lockToken, attemptNumber, expiresAt
+- Crash recovery does not depend on leases: it is driven by worker heartbeats (see above)
 
-**Key:** `chronos:lease:task:{taskId}`  
+**Key:** `chronos:lease:task:{executionId}:{taskId}`  
 **Value:** JSON TaskLease object  
 **TTL:** 5 minutes (default)
 
 **Difference from locks:**
-- **Lock:** Short-lived, atomic claim mechanism
-- **Lease:** Longer-lived, execution tracking + recovery metadata
+- **Lock:** Atomic claim mechanism that prevents concurrent execution
+- **Lease:** Execution tracking metadata
 
-### 4. Task Recovery Service
+### 4. Scheduler Recovery Sweeps
 
-**Purpose:** Detect and recover abandoned tasks
+**Purpose:** Keep executions moving when events are lost, workers disappear or the scheduler restarts
 
-**Implementation:**
-- `TaskRecoveryService` scans for expired leases
-- Runs every **30 seconds** (configurable)
-- Initial delay: **60 seconds** (give workers time to start)
+**Implementation (`RestartRecoveryService`, leader only):**
+- **Retry sweep** (every 2s): dispatches retry attempts whose `nextRetryAt` has passed
+- **Recovery sweep** (every 60s, first run 15s after startup):
+  1. Releases dispatch claims of attempts that no worker started within the dispatch timeout (5 minutes)
+  2. Dispatches ready tasks of all PENDING/RUNNING executions
+- **Worker loss:** `WorkerMonitorService` (heartbeat expiry) and `WorkerUnavailableEvent` requeue tasks RUNNING on that worker
 
-**Recovery process:**
-1. Find all expired leases: `taskLeaseService.findExpiredLeases()`
-2. For each expired lease:
-   - Force-release lock: `taskLockService.forceRelease(taskId)`
-   - Delete lease: `taskLeaseService.forceReleaseLease(taskId)`
-   - Republish event: `kafkaTemplate.send(TASK_READY, taskReadyEvent)`
+Each task attempt is claimed with an atomic conditional update before its TaskReady event is
+written to the outbox, so the sweeps and event consumers never dispatch the same attempt twice.
 
 **Configuration:**
 ```yaml
 chronos:
-  recovery:
-    scan-interval: 30000      # 30 seconds
-    initial-delay: 60000      # 60 seconds
-    enabled: true
+  scheduler:
+    restart-recovery:
+      enabled: true
+      dispatch-timeout: 5m
+      retry-sweep-interval: 2000   # ms
+      sweep-interval: 60000        # ms
+      initial-delay: 15000         # ms
 ```
 
 ### 5. Event Idempotency Service
@@ -315,93 +315,54 @@ chronos:
 
 ## Configuration Reference
 
-### Worker Service Configuration
+The defaults below come from the services' `application.yml` files (the full list is in
+[README.md](README.md#configuration-defaults)).
 
 ```yaml
-# Worker identification
+# Worker service
 worker:
-  id: ${WORKER_ID:worker-001}
-  supported-task-types: IMAGE_RESIZE,DATA_PROCESSING,EMAIL_SEND
-
-# Heartbeat
+  heartbeat.interval: 10000             # ms; the heartbeat key expires after 30s
+  supported-task-types: IMAGE_RESIZE,IMAGE_COMPRESS,DATA_PROCESSING,DATA_VALIDATION
 chronos:
-  heartbeat:
-    interval: 10000          # 10 seconds
-    ttl: 30000              # 30 seconds
-    
-  # Lock and lease
-  lock:
-    task-lock-ttl: 5m       # 5 minutes
-    
+  lock.task-lock-ttl: 5m                # per {executionId}:{taskId}
   task:
-    lease-duration: 5m      # 5 minutes
-    
-  # Retry policy
-  retry:
-    max-attempts: 3
-    base-delay: 5s
-    backoff-multiplier: 6.0
-    max-delay: 5m
-    
-  # Recovery
-  recovery:
-    scan-interval: 30000    # 30 seconds
-    initial-delay: 60000    # 60 seconds
-    enabled: true
-    
-  # Event idempotency
-  event:
-    idempotency-ttl: 7d     # 7 days
+    lease-duration: 5m
+    lease-renewal-interval: 120000      # ms; locks and leases of running tasks are extended
+  event.idempotency-ttl: 7d
 
-# Kafka
-spring:
-  kafka:
-    consumer:
-      group-id: chronos-worker-group
-      enable-auto-commit: false
-      auto-offset-reset: earliest
+# Scheduler service
+chronos:
+  scheduler:
+    retry:                              # used when a task has no retryConfig
+      initial-delay: 5s
+      backoff-multiplier: 2.0
+      max-delay: 5m
+    restart-recovery:
+      dispatch-timeout: 5m              # re-dispatch attempts no worker picked up
+      retry-sweep-interval: 2000        # ms
+      sweep-interval: 60000             # ms
+worker.monitor.interval: 15000          # ms; heartbeat expiry check (leader only)
 ```
+
+Per-task settings come from the workflow definition: `retryConfig` (maxAttempts, initialDelayMs,
+backoffMultiplier, maxDelayMs) and `timeoutMs`.
 
 ## Monitoring and Observability
 
-### Key Metrics to Monitor
+The metrics, dashboard and alerts are described in [observability-architecture.md](observability-architecture.md).
+The ones most relevant to failure handling:
 
-1. **Worker Health:**
-   - Active workers count
-   - Heartbeat failure rate
-   - Worker AVAILABLE vs BUSY ratio
+| Signal | Metric / alert |
+|---|---|
+| Workers alive | `count(up{job="worker-service"} == 1)`, alert `NoWorkersAvailable` |
+| Scheduler leadership | `chronos_scheduler_leader`, alert `NoSchedulerLeader` |
+| Retries and requeues | `chronos_tasks_total{outcome="retried"}`, `{outcome="requeued"}` |
+| Permanent failures | `chronos_tasks_total{outcome="failed"}`, `chronos_task_dlq_total`, alert `TasksDeadLettered` |
+| Undelivered dispatches | `chronos_outbox_pending`, alert `OutboxBacklog` |
+| Execution failure rate | `chronos_workflow_executions_total{status="FAILED"}`, alert `HighWorkflowFailureRate` |
 
-2. **Task Execution:**
-   - Tasks in progress (lease count)
-   - Average task duration
-   - Task success vs failure rate
-
-3. **Recovery:**
-   - Expired lease count
-   - Recovery trigger rate
-   - Time to recovery (lease expiry to reassignment)
-
-4. **Retry:**
-   - Retry attempt distribution (attempt 1, 2, 3)
-   - Backoff delay effectiveness
-   - Permanent failure rate
-
-5. **DLQ:**
-   - DLQ event rate
-   - Top failure reasons
-   - DLQ message age
-
-### Logging
-
-All components use structured logging with correlation IDs:
-
-```
-INFO  [worker-001] Task claimed: taskId=task-123, workerId=worker-001
-INFO  [worker-001] Task completed: taskId=task-123, attempt=1, duration=1234ms
-ERROR [worker-001] Task failed: taskId=task-123, attempt=1/3, retriable=true
-WARN  [recovery]   Task recovery triggered: taskId=task-123, expiredWorker=worker-001
-ERROR [recovery]   Task permanently failed: taskId=task-123, attempts=3
-```
+Recovery actions are logged by the scheduler (`Marking worker as unavailable`, `Released task lock of lost
+worker`, `Recovered N task(s)`, `Released stale dispatch`).
 
 ## Best Practices
 
@@ -438,10 +399,9 @@ public void processOrder(Order order) {
 
 ### 2. Set Appropriate Timeouts
 
-**Lease TTL should be 2-3x expected task duration:**
-- Short tasks (< 1 min): 5-minute lease is safe
-- Long tasks (5-10 min): extend lease or increase default
-- Very long tasks (> 15 min): consider breaking into smaller tasks
+Give every task a `timeoutMs` a little above its normal duration: an attempt that exceeds it is aborted
+and retried (timeouts count as retriable failures). Locks and leases of running tasks are renewed
+automatically, so long tasks are not reassigned while their worker is alive.
 
 ### 3. Handle Non-Retriable Errors
 
@@ -465,24 +425,18 @@ public void executeTask(TaskReadyEvent event) {
 
 ### 4. Monitor DLQ
 
-**Set up alerts for DLQ activity:**
-```yaml
-alerts:
-  - name: high-dlq-rate
-    condition: rate(dlq_messages_total[5m]) > 10
-    severity: warning
-    
-  - name: dlq-message-aging
-    condition: max(dlq_message_age_seconds) > 3600
-    severity: critical
+The `TasksDeadLettered` alert fires when any task is dead-lettered within 15 minutes. Inspect the events:
+
+```bash
+docker exec chronos-kafka kafka-console-consumer --bootstrap-server localhost:9092 \
+  --topic chronos.task.failed.permanently --from-beginning
 ```
 
 ### 5. Test Failure Scenarios
 
 **Integration tests should cover:**
 - Worker crash mid-execution
-- Network timeout
-- Lease expiration
+- Task timeout
 - Retry exhaustion
 - Duplicate events
 - Optimistic locking conflicts
@@ -500,35 +454,27 @@ alerts:
 - Perfect failure detection (impossible in async distributed systems)
 - Significant performance overhead
 
-### 2. Lease Expiry During Execution
+### 2. False Positives in Failure Detection
 
-**Limitation:** Lease may expire while worker is still processing
+**Limitation:** A worker that stops heartbeating (e.g. a long GC pause or a network partition) is treated
+as dead; its tasks are requeued and may run twice.
 
 **Mitigation:**
-- Set lease TTL 2-3x expected duration
-- Extend lease for long-running tasks
-- Design tasks to complete quickly
+- The first result reported for an attempt wins; duplicates are ignored
+- Heartbeat TTL (30s) is three times the heartbeat interval (10s)
+- Tasks should be idempotent
 
-**Why:** Perfect lease renewal requires:
-- Continuous communication with coordinator
-- Differentiate between slow and crashed workers (hard)
-- May still fail in network partition
+**Why:** Distinguishing a slow worker from a crashed one is impossible in an asynchronous system.
 
 ### 3. Recovery Delay
 
-**Limitation:** 5-6 minute delay before task reassignment
+**Limitation:** A crashed worker's tasks are reassigned after 30–45 seconds (heartbeat TTL plus the
+15-second monitor interval). A lost `TaskReady` event is re-sent after the 5-minute dispatch timeout.
 
-**Components:**
-- Lease TTL: 5 minutes
-- Recovery scan interval: 30 seconds
-- Total: ~5.5 minutes
+**Mitigation:** Lower `worker.monitor.interval`, the heartbeat TTL or `dispatch-timeout` for
+latency-sensitive workloads.
 
-**Mitigation:**
-- Reduce lease TTL for time-critical tasks
-- Increase recovery scan frequency
-- Monitor expired lease count
-
-**Why:** Shorter TTL increases risk of premature reassignment
+**Why:** Shorter timeouts increase the risk of false positives (above).
 
 ### 4. Redis as Single Point of Failure
 
@@ -580,15 +526,15 @@ States:
 
 Chronos provides **at-least-once execution** with comprehensive failure recovery:
 
-🟢 **Automatic recovery** from worker crashes via lease expiration  
-🟢 **Retry with exponential backoff** for transient failures  
+🟢 **Automatic recovery** from worker crashes via heartbeat expiry (tasks requeued, locks released)  
+🟢 **Retry with exponential backoff** for transient failures, and **timeouts** for hung attempts  
 🟢 **Dead letter queue** for permanent failures  
 🟢 **Event idempotency** prevents duplicate processing  
 🟢 **Optimistic locking** prevents lost updates  
 🟢 **Distributed locking** prevents concurrent execution  
 
 🟡 **Tasks must be idempotent** to handle at-least-once semantics  
-🟡 **Recovery delay** of ~5.5 minutes for crashed workers  
+🟡 **Recovery delay** of 30–45 seconds for crashed workers  
 🟡 **Redis dependency** for coordination and state  
 
 This design provides production-grade fault tolerance while maintaining simplicity and acceptable performance.

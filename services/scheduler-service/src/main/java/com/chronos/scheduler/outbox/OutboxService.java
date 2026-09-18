@@ -5,15 +5,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.util.UUID;
 
 /**
  * Service for managing outbox messages.
  * 
- * Provides methods to create outbox messages within a transaction.
- * The actual publishing is done by OutboxPublisherService.
+ * Stores messages durably in MongoDB before they are sent to Kafka, so a message
+ * survives Kafka outages and scheduler restarts. The actual publishing is done by
+ * OutboxPublisherService (at-least-once; consumers must be idempotent).
  */
 @Service
 public class OutboxService {
@@ -30,7 +30,6 @@ public class OutboxService {
     
     /**
      * Create an outbox message for later publishing.
-     * Must be called within an existing transaction to ensure atomicity.
      * 
      * @param topic Kafka topic
      * @param messageKey Kafka message key
@@ -38,7 +37,6 @@ public class OutboxService {
      * @param messageType message type for deserialization
      * @return the created outbox message
      */
-    @Transactional
     public OutboxMessage createMessage(String topic, String messageKey, Object payload, String messageType) {
         try {
             String payloadJson = objectMapper.writeValueAsString(payload);

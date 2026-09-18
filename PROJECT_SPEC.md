@@ -1,5 +1,8 @@
-````markdown
 # Chronos — Distributed Workflow Orchestration Engine
+
+> **Note:** this is the original specification Chronos was built from. The implementation differs in
+> places (for example scheduler-owned retries, cron scheduling, timeouts, and the exact API paths).
+> The [README](README.md) and [docs/](docs/README.md) describe the system as built.
 
 ## 1. Project Overview
 
@@ -197,7 +200,7 @@ High-level architecture:
                   +----------------------+
                   | Prometheus + Grafana |
                   +----------------------+
-````
+```
 
 ---
 
@@ -1953,7 +1956,7 @@ The system successfully demonstrates:
 
 ---
 
-**Project Status**: ✅ PRODUCTION READY (after P0 validation)  
+**Project Status**: Implemented — see the README for the current system  
 **Last Updated**: 2026-09-15  
 **Version**: 1.0.0
 

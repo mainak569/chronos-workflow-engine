@@ -1,6 +1,5 @@
 package com.chronos.scheduler.config;
 
-import com.chronos.scheduler.event.TaskReadyEvent;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,7 +15,7 @@ import java.util.Map;
 
 /**
  * Kafka producer configuration for scheduler-service.
- * Configures producers for publishing TaskReadyEvent.
+ * A single JSON producer is used for TaskReady events (via the outbox) and dead-letter records.
  */
 @Configuration
 public class KafkaProducerConfig {
@@ -25,29 +24,32 @@ public class KafkaProducerConfig {
     private String bootstrapServers;
 
     @Bean
-    public ProducerFactory<String, TaskReadyEvent> taskEventProducerFactory() {
+    public ProducerFactory<String, Object> producerFactory() {
         Map<String, Object> config = new HashMap<>();
         config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        // Consumers live in other services with their own event classes, so don't send
+        // __TypeId__ headers naming this service's classes (they cannot be loaded there)
+        config.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
         
-        // Idempotence for exactly-once semantics
+        // Reliability settings
         config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
         config.put(ProducerConfig.ACKS_CONFIG, "all");
         config.put(ProducerConfig.RETRIES_CONFIG, 3);
         config.put(ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION, 5);
         
-        // Retry backoff
+        // Performance settings
         config.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, 1000);
         
-        // Compression for network efficiency
+        // Compression
         config.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
         
         return new DefaultKafkaProducerFactory<>(config);
     }
 
     @Bean
-    public KafkaTemplate<String, TaskReadyEvent> taskEventKafkaTemplate() {
-        return new KafkaTemplate<>(taskEventProducerFactory());
+    public KafkaTemplate<String, Object> kafkaTemplate() {
+        return new KafkaTemplate<>(producerFactory());
     }
 }

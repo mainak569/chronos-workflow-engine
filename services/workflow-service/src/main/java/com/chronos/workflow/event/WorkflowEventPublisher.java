@@ -36,13 +36,12 @@ public class WorkflowEventPublisher {
                 .correlationId(execution.getId())
                 .workflowId(execution.getWorkflowId())
                 .executionId(execution.getId())
-                .ownerId(execution.getTriggeredBy())
+                .ownerId(execution.getOwnerId())
                 .workflowName(execution.getWorkflowName())
                 .build();
 
-        // Use workflowId as message key for consistent partitioning
-        // All events for the same workflow go to the same partition
-        String messageKey = execution.getWorkflowId();
+        // Key by executionId, like all task events, so events of one execution stay ordered
+        String messageKey = execution.getId();
 
         log.info("Publishing WorkflowCreatedEvent: workflowId={}, executionId={}, eventId={}, correlationId={}",
                 event.getWorkflowId(), event.getExecutionId(), event.getEventId(), event.getCorrelationId());

@@ -4,6 +4,7 @@ import com.chronos.workflow.domain.TaskDefinition;
 import com.chronos.workflow.domain.User;
 import com.chronos.workflow.domain.Workflow;
 import com.chronos.workflow.dto.CreateWorkflowRequest;
+import com.chronos.workflow.event.WorkflowEventPublisher;
 import com.chronos.workflow.repository.UserRepository;
 import com.chronos.workflow.repository.WorkflowRepository;
 import com.chronos.workflow.security.JwtTokenProvider;
@@ -12,6 +13,7 @@ import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -69,6 +71,10 @@ class WorkflowAuthorizationIntegrationTest {
     @Autowired
     private JwtTokenProvider jwtTokenProvider;
 
+    // No Kafka broker in this test
+    @MockBean
+    private WorkflowEventPublisher workflowEventPublisher;
+
     private User user1;
     private User user2;
     private String user1Token;
@@ -110,7 +116,7 @@ class WorkflowAuthorizationIntegrationTest {
         mockMvc.perform(post("/api/v1/workflows")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isForbidden()); // Spring Security returns 403 for missing token
+                .andExpect(status().isUnauthorized()); // Spring Security returns 403 for missing token
     }
 
     @Test
@@ -125,7 +131,7 @@ class WorkflowAuthorizationIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .header("Authorization", "Bearer invalid.jwt.token")
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -141,7 +147,7 @@ class WorkflowAuthorizationIntegrationTest {
                         .header("Authorization", "Bearer " + user1Token)
                         .content(objectMapper.writeValueAsString(request)))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.id").exists())
+                .andExpect(jsonPath("$.workflowId").exists())
                 .andExpect(jsonPath("$.name").value("Test Workflow"))
                 .andExpect(jsonPath("$.ownerId").value(user1.getId()));
 
@@ -164,7 +170,7 @@ class WorkflowAuthorizationIntegrationTest {
                         .header("Authorization", "Bearer " + user1Token))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1))
-                .andExpect(jsonPath("$[0].id").value(user1Workflow.getId()))
+                .andExpect(jsonPath("$[0].workflowId").value(user1Workflow.getId()))
                 .andExpect(jsonPath("$[0].name").value("User1 Workflow"))
                 .andExpect(jsonPath("$[0].ownerId").value(user1.getId()));
 
@@ -173,7 +179,7 @@ class WorkflowAuthorizationIntegrationTest {
                         .header("Authorization", "Bearer " + user2Token))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1))
-                .andExpect(jsonPath("$[0].id").value(user2Workflow.getId()))
+                .andExpect(jsonPath("$[0].workflowId").value(user2Workflow.getId()))
                 .andExpect(jsonPath("$[0].name").value("User2 Workflow"))
                 .andExpect(jsonPath("$[0].ownerId").value(user2.getId()));
     }
@@ -195,7 +201,7 @@ class WorkflowAuthorizationIntegrationTest {
         mockMvc.perform(get("/api/v1/workflows/" + user1Workflow.getId())
                         .header("Authorization", "Bearer " + user1Token))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.id").value(user1Workflow.getId()))
+                .andExpect(jsonPath("$.workflowId").value(user1Workflow.getId()))
                 .andExpect(jsonPath("$.ownerId").value(user1.getId()));
     }
 
@@ -232,13 +238,13 @@ class WorkflowAuthorizationIntegrationTest {
 
         // When / Then
         mockMvc.perform(get("/api/v1/workflows"))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
 
         mockMvc.perform(get("/api/v1/workflows/" + workflow.getId()))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
 
         mockMvc.perform(delete("/api/v1/workflows/" + workflow.getId()))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -253,14 +259,14 @@ class WorkflowAuthorizationIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .header("Authorization", user1Token)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
 
         // Wrong prefix
         mockMvc.perform(post("/api/v1/workflows")
                         .contentType(MediaType.APPLICATION_JSON)
                         .header("Authorization", "Basic " + user1Token)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -306,7 +312,53 @@ class WorkflowAuthorizationIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .header("Authorization", "Bearer " + expiredToken)
                         .content(objectMapper.writeValueAsString(request)))
-                .andExpect(status().isForbidden());
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    @Order(11)
+    @DisplayName("Should restrict workflow executions to the workflow owner")
+    void shouldRestrictExecutionsToOwner() throws Exception {
+        // Given - user1 owns a workflow
+        Workflow user1Workflow = createWorkflowForUser(user1.getId(), "User1 Workflow");
+
+        // user2 cannot execute it
+        mockMvc.perform(post("/api/v1/workflows/" + user1Workflow.getId() + "/execute")
+                        .header("Authorization", "Bearer " + user2Token))
+                .andExpect(status().isNotFound());
+
+        // user1 can; triggeredBy comes from the token, not from the request body
+        String response = mockMvc.perform(post("/api/v1/workflows/" + user1Workflow.getId() + "/execute")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .header("Authorization", "Bearer " + user1Token)
+                        .content("{\"triggeredBy\":\"someone-else\",\"input\":{\"k\":\"v\"}}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.triggeredBy").value(user1.getId()))
+                .andReturn().getResponse().getContentAsString();
+        String executionId = objectMapper.readTree(response).get("executionId").asText();
+
+        // user2 cannot see, inspect or cancel the execution
+        mockMvc.perform(get("/api/v1/workflows/executions/" + executionId)
+                        .header("Authorization", "Bearer " + user2Token))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/v1/workflows/executions/" + executionId + "/tasks")
+                        .header("Authorization", "Bearer " + user2Token))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(post("/api/v1/workflows/executions/" + executionId + "/cancel")
+                        .header("Authorization", "Bearer " + user2Token))
+                .andExpect(status().isNotFound());
+
+        // user1 can, and cancelling twice is a conflict
+        mockMvc.perform(get("/api/v1/workflows/executions/" + executionId + "/tasks")
+                        .header("Authorization", "Bearer " + user1Token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1));
+        mockMvc.perform(post("/api/v1/workflows/executions/" + executionId + "/cancel")
+                        .header("Authorization", "Bearer " + user1Token))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/v1/workflows/executions/" + executionId + "/cancel")
+                        .header("Authorization", "Bearer " + user1Token))
+                .andExpect(status().isConflict());
     }
 
     // Helper methods
@@ -314,6 +366,7 @@ class WorkflowAuthorizationIntegrationTest {
     private CreateWorkflowRequest createSampleWorkflowRequest() {
         TaskDefinition task = TaskDefinition.builder()
                 .taskId("task-1")
+                .name("Task 1")
                 .taskType("HTTP")
                 .configuration(Map.of(
                         "url", "https://api.example.com",
@@ -332,6 +385,7 @@ class WorkflowAuthorizationIntegrationTest {
     private Workflow createWorkflowForUser(String ownerId, String name) {
         TaskDefinition task = TaskDefinition.builder()
                 .taskId("task-1")
+                .name("Task 1")
                 .taskType("HTTP")
                 .configuration(Map.of("url", "https://example.com"))
                 .dependencies(Set.of())

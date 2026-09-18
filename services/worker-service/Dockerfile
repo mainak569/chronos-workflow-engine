@@ -72,13 +72,12 @@ ENV JAVA_OPTS="-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseC
     SERVER_PORT=8083 \
     MANAGEMENT_PORT=9083 \
     SPRING_PROFILES_ACTIVE=docker \
-    WORKER_ID="" \
     TZ=UTC
 
 # Health check configuration
 # Checks the Spring Boot Actuator health endpoint
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget --quiet --tries=1 --spider http://localhost:${SERVER_PORT}/actuator/health || exit 1
+    CMD wget --quiet --tries=1 --spider http://localhost:${MANAGEMENT_PORT}/actuator/health || exit 1
 
 # Entrypoint with optimized JVM settings
 ENTRYPOINT ["sh", "-c", "exec java ${JAVA_OPTS} \

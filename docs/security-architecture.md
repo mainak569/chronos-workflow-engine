@@ -2,7 +2,11 @@
 
 ## Overview
 
-Chronos implements JWT-based authentication and ownership-based authorization to secure workflow APIs. Users must authenticate to access the system, and can only manage workflows they own.
+Chronos implements JWT-based authentication and ownership-based authorization to secure workflow APIs. Users must authenticate to access the system, and can only see and manage workflows and executions they own.
+
+JWTs are issued by the workflow service and validated twice: by the **API gateway** before a request is
+forwarded (rejecting it with `401` early) and again by the **workflow service**, which also loads the user.
+Both use the same HMAC secret (`JWT_SECRET`).
 
 **Security Model:** Authentication + Authorization + Ownership
 
@@ -61,8 +65,8 @@ Chronos implements JWT-based authentication and ownership-based authorization to
 │                   Authorization Layer                       │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │  - Check @PreAuthorize("isAuthenticated()")        │     │
-│  │  - Verify workflow ownership                       │     │
-│  │  - Return 403 if not owner                         │     │
+│  │  - Scope every lookup to the caller (ownerId)      │     │
+│  │  - Return 404 if missing or owned by someone else  │     │
 │  └────────────────────────────────────────────────────┘     │
 └────────────────────────┬────────────────────────────────────┘
                          │
@@ -212,11 +216,14 @@ public class Workflow {
 | Operation | Rule | Check |
 |-----------|------|-------|
 | Create Workflow | Authenticated | ownerId = current user |
-| Read Workflow | Owner only | workflow.ownerId == userId |
-| Update Workflow | Owner only | workflow.ownerId == userId |
-| Delete Workflow | Owner only | workflow.ownerId == userId |
-| List Workflows | Owner only | filter by ownerId == userId |
-| Execute Workflow | Owner only | workflow.ownerId == userId |
+| Read Workflow | Owner only | `findByIdAndOwnerId(id, userId)` |
+| Delete Workflow | Owner only | `existsByIdAndOwnerId(id, userId)` |
+| List Workflows | Owner only | `findByOwnerId(userId)` |
+| Execute Workflow | Owner only | `findByIdAndOwnerId(id, userId)`; `triggeredBy` = userId from the token |
+| Read / cancel Execution, list its tasks | Owner only | `execution.ownerId == userId` |
+
+Resources of other users are reported as **404 Not Found**, not 403, so their IDs cannot be probed.
+Workflows cannot be updated (create a new one instead).
 
 ### Authorization Checks
 
@@ -231,19 +238,12 @@ public List<Workflow> getWorkflows() {
 }
 ```
 
-**Method 2: Service-Level Ownership Validation**
+**Method 2: Service-Level Ownership Validation** (executions)
 ```java
-public Workflow getWorkflow(String workflowId) {
-    Workflow workflow = workflowRepository.findById(workflowId)
-        .orElseThrow(() -> new NotFoundException("Workflow not found"));
-    
-    String currentUserId = getCurrentUserId();
-    
-    if (!workflow.getOwnerId().equals(currentUserId)) {
-        throw new ForbiddenException("Access denied: not the owner");
-    }
-    
-    return workflow;
+public WorkflowExecution getExecution(String executionId, String ownerId) {
+    return executionRepository.findById(executionId)
+            .filter(execution -> ownerId.equals(execution.getOwnerId()))
+            .orElseThrow(() -> new ExecutionNotFoundException("Execution not found: " + executionId));
 }
 ```
 
@@ -425,12 +425,13 @@ GET  /actuator/health  - Health check
 ### Protected Endpoints (Authentication Required)
 
 ```
-GET    /api/workflows           - List user's workflows
-POST   /api/workflows           - Create workflow (auto-set ownerId)
-GET    /api/workflows/{id}      - Get workflow (ownership check)
-PUT    /api/workflows/{id}      - Update workflow (ownership check)
-DELETE /api/workflows/{id}      - Delete workflow (ownership check)
-POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
+GET    /api/v1/workflows                          - List user's workflows
+POST   /api/v1/workflows                          - Create workflow (auto-set ownerId)
+GET    /api/v1/workflows/{id}                     - Get workflow (ownership check)
+DELETE /api/v1/workflows/{id}                     - Delete workflow (ownership check)
+POST   /api/v1/workflows/{id}/execute             - Execute workflow (ownership check)
+GET    /api/v1/workflows/executions/{id}[/tasks]  - Execution and tasks (ownership check)
+POST   /api/v1/workflows/executions/{id}/cancel   - Cancel execution (ownership check)
 ```
 
 ### Response Codes
@@ -440,10 +441,10 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
 | 200 | Success | Login successful |
 | 201 | Created | User registered |
 | 400 | Bad Request | Invalid email format |
-| 401 | Unauthorized | Missing or invalid JWT |
-| 403 | Forbidden | Not the workflow owner |
-| 404 | Not Found | Workflow doesn't exist |
-| 409 | Conflict | Email already registered |
+| 401 | Unauthorized | Missing, invalid or expired JWT; wrong password |
+| 404 | Not Found | Workflow/execution doesn't exist or belongs to another user |
+| 409 | Conflict | Email already registered; execution already finished |
+| 429 | Too Many Requests | Gateway rate limit exceeded |
 | 500 | Server Error | Internal error |
 
 ## Security Best Practices
@@ -457,9 +458,9 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
    - Timing-attack resistant comparison
 
 2. **JWT Security**
-   - Signed with HS256
+   - HMAC-SHA signature (HS256/384/512, chosen from the key length; HS512 with a 64-byte key)
    - Secret from environment variable
-   - 24-hour expiration
+   - 1-hour expiration in Docker (`JWT_EXPIRATION_MS`), 24 hours by default when run locally
    - No sensitive data in payload
    - Validated on every request
 
@@ -467,7 +468,7 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
    - ownerId tracked on all resources
    - Service-level ownership checks
    - Repository-level filtering
-   - 403 Forbidden for violations
+   - 404 Not Found for other users' resources
 
 4. **Input Validation**
    - Email format validation
@@ -490,7 +491,6 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
 
 - Multi-factor authentication (MFA)
 - OAuth2 integration
-- Rate limiting
 - Account lockout after failed attempts
 - Password reset flow
 - Email verification
@@ -510,13 +510,14 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
 
 **2. JWT Theft**
 - **Threat:** Attacker steals JWT token
-- **Mitigation:** HTTPS only, short expiration (24h), no refresh tokens
+- **Mitigation:** Short expiration (1h in Docker), no refresh tokens. TLS is not configured in the local
+  stack; in production it should terminate in front of the gateway
 - **Risk Level:** Medium
 
 **3. Brute Force Login**
 - **Threat:** Attacker tries many passwords
-- **Mitigation:** BCrypt (slow by design)
-- **Future:** Rate limiting, account lockout
+- **Mitigation:** BCrypt (slow by design), gateway rate limiting (120 requests/minute per IP for anonymous calls)
+- **Future:** Account lockout
 - **Risk Level:** Medium
 
 **4. SQL Injection**
@@ -550,20 +551,19 @@ POST   /api/workflows/{id}/execute - Execute workflow (ownership check)
 ### Environment Variables
 
 ```bash
-# JWT Configuration (REQUIRED)
-CHRONOS_JWT_SECRET=your-secret-key-min-256-bits-use-openssl-rand-base64-32
+# JWT signing secret, shared by the gateway and the workflow service (REQUIRED outside local dev)
+JWT_SECRET=your-secret-key-min-256-bits-use-openssl-rand-base64-48
 
-# JWT Expiration (optional, default 24h)
-CHRONOS_JWT_EXPIRATION=86400000  # milliseconds
+# JWT expiration in milliseconds (docker-compose default: 1 hour)
+JWT_EXPIRATION_MS=3600000
 
-# Password Strength (optional, default 10)
-CHRONOS_BCRYPT_STRENGTH=10
-
-# HTTPS Enforcement (production)
-SERVER_SSL_ENABLED=true
-SERVER_SSL_KEY_STORE=classpath:keystore.p12
-SERVER_SSL_KEY_STORE_PASSWORD=${SSL_KEYSTORE_PASSWORD}
+# Scheduler operations API token (empty = API disabled)
+CHRONOS_ADMIN_TOKEN=
 ```
+
+When running the workflow service outside Docker, `CHRONOS_JWT_SECRET` / `CHRONOS_JWT_EXPIRATION` take
+precedence over `JWT_SECRET`. BCrypt strength is fixed at 10 in `SecurityConfig`. TLS can be enabled
+with the standard Spring Boot `server.ssl.*` properties.
 
 ### Generating JWT Secret
 
@@ -584,15 +584,8 @@ export CHRONOS_JWT_SECRET="K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol/pe/Unols="
 chronos:
   security:
     jwt:
-      secret: ${CHRONOS_JWT_SECRET}  # From environment variable
+      secret: ${CHRONOS_JWT_SECRET:${JWT_SECRET:<dev default>}}
       expiration: ${CHRONOS_JWT_EXPIRATION:86400000}  # 24 hours
-    password:
-      bcrypt-strength: ${CHRONOS_BCRYPT_STRENGTH:10}
-    
-spring:
-  security:
-    filter:
-      order: -100
 ```
 
 ## Testing Strategy

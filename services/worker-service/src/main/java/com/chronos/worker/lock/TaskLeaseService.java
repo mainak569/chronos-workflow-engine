@@ -203,7 +203,7 @@ public class TaskLeaseService {
     
     /**
      * Find all expired leases.
-     * Used by TaskRecoveryService to identify abandoned tasks.
+     * Useful for diagnostics of abandoned tasks (lease keys also expire in Redis via TTL).
      * 
      * @return list of expired leases
      */

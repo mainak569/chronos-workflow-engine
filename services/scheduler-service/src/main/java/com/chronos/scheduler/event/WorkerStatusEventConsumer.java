@@ -1,6 +1,7 @@
 package com.chronos.scheduler.event;
 
 import com.chronos.scheduler.config.KafkaTopics;
+import com.chronos.scheduler.service.WorkerFailureHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -12,21 +13,22 @@ import org.springframework.stereotype.Component;
 
 /**
  * Consumer for worker status events.
- * Maintains worker registry for task assignment decisions.
+ * Workers maintain their own registry entries in Redis; the scheduler reacts to
+ * workers leaving by requeueing the tasks they were running.
  */
 @Component
 public class WorkerStatusEventConsumer {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerStatusEventConsumer.class);
 
+    private final WorkerFailureHandler workerFailureHandler;
+
+    public WorkerStatusEventConsumer(WorkerFailureHandler workerFailureHandler) {
+        this.workerFailureHandler = workerFailureHandler;
+    }
+
     /**
-     * Handle WorkerRegisteredEvent.
-     * Adds worker to available worker pool.
-     *
-     * @param event The worker registered event
-     * @param partition Kafka partition
-     * @param offset Kafka offset
-     * @param acknowledgment Manual acknowledgment handle
+     * Handle WorkerRegisteredEvent (informational).
      */
     @KafkaListener(
             topics = KafkaTopics.WORKER_REGISTERED,
@@ -39,37 +41,15 @@ public class WorkerStatusEventConsumer {
             @Header(KafkaHeaders.OFFSET) long offset,
             Acknowledgment acknowledgment) {
 
-        log.info("Received WorkerRegisteredEvent: workerId={}, taskTypes={}, eventId={}, partition={}, offset={}",
-                event.getWorkerId(), event.getSupportedTaskTypes(), 
+        log.info("Worker registered: workerId={}, taskTypes={}, eventId={}, partition={}, offset={}",
+                event.getWorkerId(), event.getSupportedTaskTypes(),
                 event.getEventId(), partition, offset);
 
-        try {
-            // Idempotency check
-            
-            // Register worker in Redis with supported task types
-            // TODO: Store in Redis with TTL matching heartbeat timeout
-            // Key: "worker:{workerId}", Value: {taskTypes, hostname, port, lastSeen}
-            
-            log.info("Successfully registered worker: workerId={}, taskTypes={}",
-                    event.getWorkerId(), event.getSupportedTaskTypes());
-
-            acknowledgment.acknowledge();
-
-        } catch (Exception e) {
-            log.error("Error processing WorkerRegisteredEvent: workerId={}, error={}",
-                    event.getWorkerId(), e.getMessage(), e);
-            throw new RuntimeException("Failed to process WorkerRegisteredEvent", e);
-        }
+        acknowledgment.acknowledge();
     }
 
     /**
-     * Handle WorkerUnavailableEvent.
-     * Removes worker from available pool and handles in-progress tasks.
-     *
-     * @param event The worker unavailable event
-     * @param partition Kafka partition
-     * @param offset Kafka offset
-     * @param acknowledgment Manual acknowledgment handle
+     * Handle WorkerUnavailableEvent: requeue tasks still RUNNING on that worker and dispatch them again.
      */
     @KafkaListener(
             topics = KafkaTopics.WORKER_UNAVAILABLE,
@@ -83,28 +63,14 @@ public class WorkerStatusEventConsumer {
             Acknowledgment acknowledgment) {
 
         log.info("Received WorkerUnavailableEvent: workerId={}, reason={}, eventId={}, partition={}, offset={}",
-                event.getWorkerId(), event.getReason(), 
+                event.getWorkerId(), event.getReason(),
                 event.getEventId(), partition, offset);
 
-        try {
-            // Idempotency check
-            
-            // Remove worker from Redis
-            // TODO: Delete "worker:{workerId}" key
-            
-            // Find tasks assigned to this worker and reschedule them
-            // TODO: Query execution state for in-progress tasks by workerId
-            // TODO: Publish TaskReadyEvents to reschedule those tasks
-            
-            log.info("Successfully processed worker unavailability: workerId={}, reason={}",
-                    event.getWorkerId(), event.getReason());
+        int requeued = workerFailureHandler.handleWorkerLost(event.getWorkerId());
 
-            acknowledgment.acknowledge();
+        log.info("Processed worker unavailability: workerId={}, requeuedTasks={}",
+                event.getWorkerId(), requeued);
 
-        } catch (Exception e) {
-            log.error("Error processing WorkerUnavailableEvent: workerId={}, error={}",
-                    event.getWorkerId(), e.getMessage(), e);
-            throw new RuntimeException("Failed to process WorkerUnavailableEvent", e);
-        }
+        acknowledgment.acknowledge();
     }
 }

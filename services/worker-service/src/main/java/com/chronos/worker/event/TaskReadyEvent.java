@@ -18,6 +18,7 @@ public class TaskReadyEvent {
     private Map<String, Object> configuration;
     private Long timeoutMs;
     private Integer maxRetries;
+    private Integer attemptNumber;
 
     // Constructors
     public TaskReadyEvent() {
@@ -102,5 +103,13 @@ public class TaskReadyEvent {
 
     public void setMaxRetries(Integer maxRetries) {
         this.maxRetries = maxRetries;
+    }
+
+    public Integer getAttemptNumber() {
+        return attemptNumber;
+    }
+
+    public void setAttemptNumber(Integer attemptNumber) {
+        this.attemptNumber = attemptNumber;
     }
 }

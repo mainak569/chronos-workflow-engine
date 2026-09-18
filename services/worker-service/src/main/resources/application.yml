@@ -1,11 +1,13 @@
 spring:
   application:
     name: worker-service
+  lifecycle:
+    timeout-per-shutdown-phase: ${SPRING_SHUTDOWN_TIMEOUT:90s}
   
   # MongoDB and Redis Configuration
   data:
     mongodb:
-      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos}
+      uri: ${MONGODB_URI:mongodb://chronos:chronos123@localhost:27017/chronos?authSource=admin}
       database: ${MONGODB_DATABASE:chronos}
       auto-index-creation: true
     redis:
@@ -44,18 +46,11 @@ server:
   port: ${SERVER_PORT:8083}
   shutdown: graceful
 
-spring:
-  lifecycle:
-    timeout-per-shutdown-phase: ${SPRING_SHUTDOWN_TIMEOUT:90s}
-
 # Worker Configuration
 worker:
   id: ${WORKER_ID:worker-${random.uuid}}
-  supported-task-types:
-    - IMAGE_RESIZE
-    - IMAGE_COMPRESS
-    - DATA_PROCESSING
-    - DATA_VALIDATION
+  # Comma-separated (read via @Value, which cannot bind YAML lists)
+  supported-task-types: ${WORKER_SUPPORTED_TASK_TYPES:IMAGE_RESIZE,IMAGE_COMPRESS,DATA_PROCESSING,DATA_VALIDATION}
   heartbeat:
     interval-seconds: 10
     ttl-seconds: 30
@@ -71,7 +66,7 @@ chronos:
     # Lease configuration
     lease-duration: ${TASK_LEASE_DURATION:5m}
     # Lease renewal configuration (for long-running tasks)
-    lease-renewal-interval: ${TASK_LEASE_RENEWAL_INTERVAL:2m}
+    lease-renewal-interval: ${TASK_LEASE_RENEWAL_INTERVAL:120000}  # milliseconds (used by @Scheduled)
     lease-extension-duration: ${TASK_LEASE_EXTENSION_DURATION:3m}
   worker:
     # Graceful shutdown timeout
@@ -123,6 +118,11 @@ management:
   endpoint:
     health:
       show-details: always
+      # Liveness/readiness groups, also served on the main server port as /livez and /readyz
+      # (actuator itself runs on a separate management port in the docker profile)
+      probes:
+        enabled: true
+        add-additional-paths: true
   health:
     circuitbreakers:
       enabled: true
