@@ -47,10 +47,10 @@ Step Functions):
             (JWT, rate limit)            │
                                          │ chronos.workflow.created
                                          ▼
-                                       Kafka
-                   chronos.task.ready ▲      │ task.started / completed / failed
-                                      │      ▼
-                          Scheduler :8082 ◀──────── Workers :8083+ (× N)
+                               ──────▶ Kafka ──────▶
+           chronos.task.ready ▲                     │ task.started / completed / failed
+                              │                     ▼
+                      Scheduler :8082 ◀──────── Workers :8083+ (× N)
                           (leader-elected)               │
                                  └──────── Redis ────────┘
                             leader lock · task locks · heartbeats
@@ -126,7 +126,7 @@ Or run the full API tour: `npx newman run postman/chronos-api.postman_collection
 `"simulateDurationMs": 5000` with `"timeoutMs": 1000` to see a timeout. Kill a worker container
 mid-task (`docker kill <id>`) and another worker picks the task up.
 
-## ✅ Testing
+## 🟢 Testing
 
 ```bash
 mvn test    # from the repository root; Docker must be running for Testcontainers
