@@ -29,7 +29,7 @@
 
 https://github.com/user-attachments/assets/741af673-e26c-4e33-aa85-8a8ba00f45ed
 
-A 2-minute walkthrough: architecture, a real workflow run replayed from its logs, failure recovery,
+A two-minute walkthrough: architecture, a real workflow run replayed from its logs, failure recovery,
 cron scheduling, leader election and scaling. [Download the video](docs/chronos-showcase.mp4).
 
 ## Overview
