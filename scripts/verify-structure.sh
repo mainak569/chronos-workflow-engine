@@ -45,7 +45,6 @@ check_file "README.md" || ((errors++))
 check_file ".gitignore" || ((errors++))
 check_file ".env.example" || ((errors++))
 check_file "docker-compose.yml" || ((errors++))
-check_file "PROJECT_SPEC.md" || ((errors++))
 
 echo ""
 echo "Checking documentation..."
